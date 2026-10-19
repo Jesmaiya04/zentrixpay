@@ -168,6 +168,11 @@ export const apis = pgTable(
     ownershipVerifiedAt: timestamp("ownership_verified_at"),
     listed: boolean("listed").notNull().default(false),
     tags: jsonb("tags").$type<string[]>().notNull().default([]),
+    // When true the proxy streams the upstream response body directly to the
+    // caller instead of buffering it. Required for SSE / chunked APIs. The
+    // payment is settled before streaming begins; a stream that fails before
+    // the first data byte is never charged (see proxyHandler in routes/apis.ts).
+    streamingEnabled: boolean("streaming_enabled").notNull().default(false),
     // Soft delete: archived APIs are hidden everywhere but keep their call history.
     archivedAt: timestamp("archived_at"),
     createdAt: timestamp("created_at").defaultNow().notNull(),

@@ -192,6 +192,9 @@ export const createApiSchema = z
     // Only these wallets may call the API; omit to allow everyone.
     payerAllowlist: payerList.optional(),
     payerDenylist: payerList.default([]),
+    // When true the proxy streams the upstream response instead of buffering
+    // it. Required for SSE / chunked APIs. Defaults to false.
+    streamingEnabled: z.boolean().default(false),
   })
   .strict();
 
@@ -215,6 +218,8 @@ export const updateApiSchema = z
     payerAllowlist: payerList.nullable().optional(),
     payerDenylist: payerList.optional(),
     listed: z.boolean().optional(),
+    // Toggle streaming on/off after creation.
+    streamingEnabled: z.boolean().optional(),
   })
   .strict();
 

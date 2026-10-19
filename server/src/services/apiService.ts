@@ -80,6 +80,7 @@ export function toOwnerApi(api: ApiRow) {
     payerAllowlist: api.payerAllowlist,
     payerDenylist: api.payerDenylist,
     listed: api.listed,
+    streamingEnabled: api.streamingEnabled,
     onchainStatus: api.onchainStatus,
     ownershipVerified: Boolean(api.ownershipVerifiedAt),
     ownershipVerification: {
@@ -190,6 +191,7 @@ export interface CreateApiInput {
   tags: string[];
   payerAllowlist?: string[];
   payerDenylist?: string[];
+  streamingEnabled?: boolean;
 }
 
 export async function createApi(input: CreateApiInput): Promise<ApiRow> {
@@ -211,6 +213,7 @@ export async function createApi(input: CreateApiInput): Promise<ApiRow> {
       payerDenylist: input.payerDenylist ?? [],
       ownershipToken: randomBytes(16).toString("hex"),
       openapiSpec: checkedOpenApiSpec(input.openapiSpec),
+      streamingEnabled: input.streamingEnabled ?? false,
       ...encryptedHeader(input.upstreamHeader),
       ...encryptedQueryParam(input.upstreamQueryParam),
     })
@@ -336,6 +339,7 @@ export interface UpdateApiInput {
   payerAllowlist?: string[] | null;
   payerDenylist?: string[];
   listed?: boolean;
+  streamingEnabled?: boolean;
 }
 
 export async function updateApi(api: ApiRow, input: UpdateApiInput): Promise<ApiRow> {
@@ -367,6 +371,7 @@ export async function updateApi(api: ApiRow, input: UpdateApiInput): Promise<Api
     tags: input.tags,
     payerAllowlist: input.payerAllowlist,
     payerDenylist: input.payerDenylist,
+    streamingEnabled: input.streamingEnabled,
     ...encryptedHeader(input.upstreamHeader),
     ...encryptedQueryParam(input.upstreamQueryParam),
   };

@@ -10,6 +10,9 @@ target/
 # Bundle analysis report (generated locally by `pnpm --filter @zentrixpay/web bundle:stats`)
 web/stats.html
 
+# pnpm content-addressable store (local cache, never committed)
+.pnpm-store/
+
 # Secrets — never commit real env files (only .env.example is tracked)
 .env
 .env.local
@@ -27,3 +30,19 @@ packages/registry-client/bindings-tmp/
 .DS_Store
 .vercel
 .idea/
+
+# Test snapshots — regenerated on demand, not committed
+**/__snapshots__/
+*.snap
+
+# Scratch / manual test files
+test-api.txt
+
+# Generated build artefacts in packages (compiled output, not source)
+packages/registry-client/vitest.config.js
+packages/registry-client/vitest.config.js.map
+packages/registry-client/vitest.config.d.ts
+packages/registry-client/vitest.config.d.ts.map
+
+# npm lock file inside the mcp workspace (pnpm-lock.yaml is canonical)
+mcp/package-lock.json
