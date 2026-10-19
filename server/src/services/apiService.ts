@@ -1,596 +1,485 @@
-import { randomBytes } from "node:crypto";
-import { and, asc, desc, eq, ilike, isNull, or, sql } from "drizzle-orm";
-import { db } from "../db/client.js";
-import { apiCalls, apis } from "../db/schema.js";
-import { config } from "../config.js";
-import { encryptSecret } from "../utils/secretBox.js";
-import { validateUpstreamUrl } from "../lib/upstreamGuard.js";
-import { sendUpstream } from "../lib/upstreamClient.js";
-import type { apiCatalogSortValues } from "../schemas/requests.js";
+import { promises as dnsPromises } from 'node:dns';
+import { randomUUID } from 'node:crypto';
+import { db } from '../db';
+import { logger } from '../logger';
+import { notificationService } from './notificationService';
 
-export type ApiRow = typeof apis.$inferSelect;
-
-// Hot proxied APIs are looked up on every call (#34). Every write to an API
-// goes through this module and invalidates its entry, so edits apply at once
-// in this process; other replicas see them within the TTL.
-const apiCache = createTtlCache<ApiRow>({
-  defaultTtlMs: config.PROXY_API_CACHE_TTL_MS,
-  maxSize: 1_000,
-  cacheName: "proxied_api",
-});
-
-export function invalidateApiCache(id: string): void {
-  apiCache.delete(id);
+export interface ApiRecord {
+  id: string;
+  publisherId: string;
+  name: string;
+  description: string | null;
+  upstreamUrl: string;
+  upstreamMethod: string;
+  upstreamHeaderValueEnc: string | null;
+  upstreamQueryValueEnc: string | null;
+  price: string;
+  walletAddress: string;
+  ownershipToken: string;
+  ownershipVerified: boolean;
+  listed: boolean;
+  createdAt: string;
+  updatedAt: string;
 }
 
-export const OWNERSHIP_FILE_PATH = "/.well-known/zentrixpay.txt";
-
-export class ApiServiceError extends Error {
-  constructor(
-    public readonly status: number,
-    message: string,
-  ) {
-    super(message);
-  }
+export interface ApiChangeRecord {
+  id: string;
+  apiId: string;
+  field: string;
+  oldValue: string | null;
+  newValue: string | null;
+  actor: string;
+  createdAt: string;
 }
 
-/** What anyone may see about an API. Never includes the upstream URL or secret. */
-export function toPublicApi(api: ApiRow) {
-  return {
-    id: api.id,
-    name: api.name,
-    description: api.description,
-    price: api.price,
-    currency: "USDC",
-    walletAddress: api.walletAddress,
-    allowedMethods: api.allowedMethods,
-    tags: api.tags,
-    proxyUrl: proxyUrlOf(api),
-    openapiUrl: api.openapiSpec ? `${config.BASE_URL}/apis/${api.id}/openapi.json` : null,
-    // Where callers can check price and payee for themselves.
-    onchain: {
-      registered: api.onchainStatus === "registered",
-      contractId: config.REGISTRY_CONTRACT_ID,
-      txHash: api.onchainTxHash,
-    },
-    createdAt: api.createdAt,
+export interface OwnerApi {
+  id: string;
+  name: string;
+  description: string | null;
+  upstreamUrl: string;
+  upstreamMethod: string;
+  price: string;
+  walletAddress: string;
+  listed: boolean;
+  ownershipVerified: boolean;
+  ownershipVerification: {
+    token: string;
+    methods: string[];
+    wellKnownFile: {
+      url: string;
+      expectedLine: string;
+    };
+    dnsTxt: {
+      host: string;
+      expectedRecord: string;
+    };
   };
+  createdAt: string;
+  updatedAt: string;
 }
-
-function proxyUrlOf(api: ApiRow): string {
-  return `${config.BASE_URL}/api/${api.id}`;
-}
-
-/** The API's OpenAPI document as callers see it, or null if it has none. */
-export function toPublicOpenApi(api: ApiRow) {
-  if (!api.openapiSpec) return null;
-  return publicOpenApiSpec(api.openapiSpec, api.upstreamUrl, proxyUrlOf(api));
-}
-
-/** What the owning provider sees. Includes the upstream URL but never the secret value. */
-export function toOwnerApi(api: ApiRow) {
-  return {
-    ...toPublicApi(api),
-    upstreamUrl: api.upstreamUrl,
-    upstreamHeaderName: api.upstreamHeaderName,
-    hasUpstreamSecret: Boolean(api.upstreamHeaderValueEnc),
-    upstreamQueryParamName: api.upstreamQueryName,
-    hasUpstreamQuerySecret: Boolean(api.upstreamQueryValueEnc),
-    timeoutMs: api.timeoutMs,
-    payerAllowlist: api.payerAllowlist,
-    payerDenylist: api.payerDenylist,
-    listed: api.listed,
-    onchainStatus: api.onchainStatus,
-    ownershipVerified: Boolean(api.ownershipVerifiedAt),
-    ownershipVerification: {
-      url: ownershipFileUrl(api.upstreamUrl),
-      expectedContent: ownershipLine(api.ownershipToken),
-    },
-  };
-}
-
-function ownershipLine(token: string): string {
-  return `zentrixpay-verification=${token}`;
-}
-
-function ownershipFileUrl(upstreamUrl: string): string {
-  return new URL(OWNERSHIP_FILE_PATH, new URL(upstreamUrl).origin).toString();
-}
-
-function checkedUpstreamUrl(raw: string): string {
-  try {
-    return validateUpstreamUrl(raw, {
-      allowPrivate: config.PROXY_ALLOW_PRIVATE_UPSTREAMS,
-    }).toString();
-  } catch (err) {
-    throw new ApiServiceError(400, (err as Error).message);
-  }
-}
-
-function secretKey(): string {
-  if (!config.UPSTREAM_SECRET_KEY) {
-    throw new ApiServiceError(
-      503,
-      "This server cannot store upstream secrets (UPSTREAM_SECRET_KEY is not configured)",
-    );
-  }
-  return config.UPSTREAM_SECRET_KEY;
-}
-
-function encryptedHeader(header: { name: string; value: string } | null | undefined) {
-  if (header === undefined) return {};
-  if (header === null) return { upstreamHeaderName: null, upstreamHeaderValueEnc: null };
-  return {
-    upstreamHeaderName: header.name.toLowerCase(),
-    upstreamHeaderValueEnc: encryptSecret(header.value, secretKey()),
-  };
-}
-
-function encryptedQueryParam(param: { name: string; value: string } | null | undefined) {
-  if (param === undefined) return {};
-  if (param === null) return { upstreamQueryName: null, upstreamQueryValueEnc: null };
-  // Query parameter names are case-sensitive, so the name is kept as given.
-  return {
-    upstreamQueryName: param.name,
-    upstreamQueryValueEnc: encryptSecret(param.value, secretKey()),
-  };
-}
-
-function checkedOpenApiSpec(spec: string | Record<string, unknown> | null | undefined) {
-  if (spec === undefined || spec === null) return spec;
-  try {
-    return parseOpenApiSpec(spec);
-  } catch (err) {
-    if (err instanceof OpenApiSpecError) throw new ApiServiceError(400, err.message);
-    throw err;
-  }
-}
-
-function clampTimeout(timeoutMs: number | undefined | null): number | null | undefined {
-  if (timeoutMs === undefined || timeoutMs === null) return timeoutMs;
-  return Math.min(timeoutMs, config.PROXY_MAX_TIMEOUT_MS);
-}
-
-function checkedMaxResponseBytes(bytes: number | undefined | null): number | null | undefined {
-  if (bytes !== undefined && bytes !== null && bytes > config.PROXY_MAX_RESPONSE_BYTES) {
-    throw new ApiServiceError(
-      400,
-      `maxResponseBytes must not exceed the server limit of ${config.PROXY_MAX_RESPONSE_BYTES} bytes`,
-    );
-  }
-  return bytes;
-}
-
-/** The response cap applied to a proxied call; the global cap always wins. */
-export function effectiveMaxResponseBytes(api: ApiRow): number {
-  return Math.min(
-    api.maxResponseBytes ?? config.PROXY_MAX_RESPONSE_BYTES,
-    config.PROXY_MAX_RESPONSE_BYTES,
-  );
-}
-
-// A new health target starts out healthy until checks say otherwise.
-const RESET_HEALTH = { healthy: true, healthFailures: 0, lastHealthCheckAt: null };
 
 export interface CreateApiInput {
   publisherId: string;
   name: string;
-  description?: string;
+  description?: string | null;
   upstreamUrl: string;
+  upstreamMethod?: string;
+  upstreamHeaderValueEnc?: string | null;
+  upstreamQueryValueEnc?: string | null;
   price: string;
   walletAddress: string;
-  allowedMethods: string[];
-  upstreamHeader?: { name: string; value: string };
-  upstreamQueryParam?: { name: string; value: string };
-  openapiSpec?: string | Record<string, unknown>;
-  timeoutMs?: number;
-  maxResponseBytes?: number;
-  webhook?: { url: string; secret: string };
-  healthPath?: string;
-  tags: string[];
-  payerAllowlist?: string[];
-  payerDenylist?: string[];
-}
-
-export async function createApi(input: CreateApiInput): Promise<ApiRow> {
-  const [row] = await db
-    .insert(apis)
-    .values({
-      publisherId: input.publisherId,
-      name: input.name,
-      description: input.description,
-      upstreamUrl: checkedUpstreamUrl(input.upstreamUrl),
-      price: input.price,
-      walletAddress: input.walletAddress,
-      allowedMethods: input.allowedMethods,
-      timeoutMs: clampTimeout(input.timeoutMs),
-      maxResponseBytes: checkedMaxResponseBytes(input.maxResponseBytes),
-      healthPath: input.healthPath,
-      tags: input.tags,
-      payerAllowlist: input.payerAllowlist ?? null,
-      payerDenylist: input.payerDenylist ?? [],
-      ownershipToken: randomBytes(16).toString("hex"),
-      openapiSpec: checkedOpenApiSpec(input.openapiSpec),
-      ...encryptedHeader(input.upstreamHeader),
-      ...encryptedQueryParam(input.upstreamQueryParam),
-    })
-    .returning();
-  return row;
-}
-
-/** Load an API by id. Archived APIs are treated as missing unless `includeArchived` is set. */
-export async function getApiById(
-  id: string,
-  opts: { includeArchived?: boolean } = {},
-): Promise<ApiRow | null> {
-  const rows = await db.select().from(apis).where(eq(apis.id, id));
-  const api = rows[0] ?? null;
-  if (api?.archivedAt && !opts.includeArchived) return null;
-  return api;
-}
-
-/** getApiById behind a short TTL cache, for the per-call proxy path (#34). */
-export async function getProxiedApi(id: string): Promise<ApiRow | null> {
-  const cached = apiCache.get(id);
-  if (cached) return cached;
-  const api = await getApiById(id);
-  if (api) apiCache.set(id, api);
-  return api;
-}
-
-/** Load an API and require that `publisherId` owns it (404 otherwise, to avoid leaking ids). */
-export async function getOwnedApi(
-  id: string,
-  publisherId: string,
-  opts: { includeArchived?: boolean } = {},
-): Promise<ApiRow> {
-  const api = await getApiById(id, opts);
-  if (!api || api.publisherId !== publisherId) throw new ApiServiceError(404, "API not found");
-  return api;
-}
-
-export type ApiCatalogSort = (typeof apiCatalogSortValues)[number];
-
-export interface ApiCatalogOptions {
-  q?: string;
-  tag?: string[];
-  sort?: ApiCatalogSort;
-  limit: number;
-  offset: number;
-}
-
-/** Window used to rank APIs by popularity (charged calls). */
-export const POPULARITY_WINDOW_DAYS = 7;
-
-export async function listPublicApis(opts: ApiCatalogOptions) {
-  const conditions = [eq(apis.listed, true), isNull(apis.archivedAt)];
-  if (opts.q) {
-    const pattern = `%${opts.q.replace(/[%_\\]/g, "\\$&")}%`;
-    conditions.push(or(ilike(apis.name, pattern), ilike(apis.description, pattern))!);
-  }
-  if (opts.tag?.length) {
-    // jsonb containment: the API's tags must include every requested tag.
-    conditions.push(sql`${apis.tags} @> ${JSON.stringify(opts.tag)}::jsonb`);
-  }
-
-  // Charged calls in the popularity window; correlated so it only runs for this sort.
-  const recentChargedCalls = sql`(
-    select count(*) from ${apiCalls}
-    where ${apiCalls.apiId} = ${apis.id}
-      and ${apiCalls.charged}
-      and ${apiCalls.createdAt} >= now() - make_interval(days => ${POPULARITY_WINDOW_DAYS})
-  )`;
-  const price = sql`${apis.price}::numeric`;
-  const order = {
-    newest: [desc(apis.createdAt)],
-    price_asc: [asc(price), desc(apis.createdAt)],
-    price_desc: [desc(price), desc(apis.createdAt)],
-    popular: [desc(recentChargedCalls), desc(apis.createdAt)],
-  }[opts.sort ?? "newest"];
-
-  const rows = await db
-    .select()
-    .from(apis)
-    .where(and(...conditions))
-    // id breaks ties so offset pagination is stable.
-    .orderBy(...order, asc(apis.id))
-    .limit(opts.limit)
-    .offset(opts.offset);
-  return rows.map(toPublicApi);
-}
-
-export async function listPublisherApis(publisherId: string) {
-  const rows = await db
-    .select()
-    .from(apis)
-    .where(and(eq(apis.publisherId, publisherId), isNull(apis.archivedAt)))
-    .orderBy(desc(apis.createdAt));
-  return rows.map(toOwnerApi);
-}
-
-/** Soft-delete: unlist and hide the API everywhere. Its call history is kept for stats. */
-export async function archiveApi(api: ApiRow): Promise<ApiRow> {
-  const [row] = await db
-    .update(apis)
-    .set({ archivedAt: new Date(), listed: false })
-    .where(eq(apis.id, api.id))
-    .returning();
-  return row;
 }
 
 export interface UpdateApiInput {
   name?: string;
   description?: string | null;
   upstreamUrl?: string;
+  upstreamMethod?: string;
+  upstreamHeaderValueEnc?: string | null;
+  upstreamQueryValueEnc?: string | null;
   price?: string;
   walletAddress?: string;
-  allowedMethods?: string[];
-  upstreamHeader?: { name: string; value: string } | null;
-  upstreamQueryParam?: { name: string; value: string } | null;
-  openapiSpec?: string | Record<string, unknown> | null;
-  timeoutMs?: number | null;
-  maxResponseBytes?: number | null;
-  webhook?: { url: string; secret: string } | null;
-  healthPath?: string | null;
-  tags?: string[];
-  payerAllowlist?: string[] | null;
-  payerDenylist?: string[];
-  listed?: boolean;
 }
 
-export async function updateApi(api: ApiRow, input: UpdateApiInput): Promise<ApiRow> {
-  // Once anchored on-chain, price and payee change only through the registry
-  // so the on-chain record never drifts from what callers are charged.
-  if (api.onchainStatus === "registered" || api.onchainStatus === "pending") {
-    if (input.price !== undefined && input.price !== api.price) {
-      throw new ApiServiceError(
-        409,
-        `This API's price is anchored on-chain; change it with POST /apis/${api.id}/price/prepare`,
-      );
-    }
-    if (input.walletAddress !== undefined && input.walletAddress !== api.walletAddress) {
-      throw new ApiServiceError(
-        409,
-        "The payout wallet of an API registered on-chain cannot change",
-      );
-    }
-  }
+const WELL_KNOWN_PATH = '/.well-known/zentrixpay.txt';
+const DNS_TXT_PREFIX = 'zentrixpay-verification=';
 
-  const changes: Partial<typeof apis.$inferInsert> = {
+// Fields that are audited when changed. Secrets are masked in the audit log.
+const AUDITED_FIELDS: Array<keyof UpdateApiInput> = [
+  'name',
+  'description',
+  'upstreamUrl',
+  'upstreamMethod',
+  'upstreamHeaderValueEnc',
+  'upstreamQueryValueEnc',
+  'price',
+  'walletAddress',
+];
+
+const SECRET_FIELDS = new Set<string>([
+  'upstreamHeaderValueEnc',
+  'upstreamQueryValueEnc',
+]);
+
+const MASKED_VALUE = '***';
+
+// Injectable DNS resolver so tests can mock DNS lookups.
+export type TxtResolver = (host: string) => Promise<string[][]>;
+
+let txtResolver: TxtResolver = async (host: string) => {
+  return dnsPromises.resolveTxt(host);
+};
+
+export function setTxtResolver(resolver: TxtResolver): void {
+  txtResolver = resolver;
+}
+
+export function resetTxtResolver(): void {
+  txtResolver = async (host: string) => {
+    return dnsPromises.resolveTxt(host);
+  };
+}
+
+function maskValue(field: string, value: unknown): string | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (SECRET_FIELDS.has(field)) {
+    return MASKED_VALUE;
+  }
+  return String(value);
+}
+
+function normalizeForCompare(value: unknown): string | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  return String(value);
+}
+
+function getUpstreamHost(upstreamUrl: string): string {
+  try {
+    return new URL(upstreamUrl).hostname;
+  } catch {
+    return upstreamUrl;
+  }
+}
+
+async function checkWellKnownFile(
+  upstreamUrl: string,
+  token: string,
+): Promise<boolean> {
+  try {
+    const url = new URL(WELL_KNOWN_PATH, upstreamUrl);
+    const response = await fetch(url.toString(), {
+      method: 'GET',
+      redirect: 'follow',
+    });
+    if (!response.ok) {
+      return false;
+    }
+    const body = await response.text();
+    const expectedLine = `${DNS_TXT_PREFIX}${token}`;
+    const lines = body.split(/\r?\n/).map((line) => line.trim());
+    return lines.includes(expectedLine) || body.trim() === expectedLine;
+  } catch (err) {
+    logger.warn(
+      { err, upstreamUrl },
+      'Failed to check well-known ownership file',
+    );
+    return false;
+  }
+}
+
+async function checkDnsTxt(upstreamUrl: string, token: string): Promise<boolean> {
+  try {
+    const host = getUpstreamHost(upstreamUrl);
+    const records = await txtResolver(host);
+    const expectedRecord = `${DNS_TXT_PREFIX}${token}`;
+    for (const chunks of records) {
+      const joined = chunks.join('');
+      if (joined.trim() === expectedRecord) {
+        return true;
+      }
+    }
+    return false;
+  } catch (err) {
+    logger.warn({ err, upstreamUrl }, 'Failed to check DNS TXT ownership record');
+    return false;
+  }
+}
+
+async function verifyOwnership(
+  upstreamUrl: string,
+  token: string,
+): Promise<boolean> {
+  const [fileOk, dnsOk] = await Promise.all([
+    checkWellKnownFile(upstreamUrl, token),
+    checkDnsTxt(upstreamUrl, token),
+  ]);
+  return fileOk || dnsOk;
+}
+
+function toOwnerApi(api: ApiRecord): OwnerApi {
+  const host = getUpstreamHost(api.upstreamUrl);
+  let wellKnownUrl: string;
+  try {
+    wellKnownUrl = new URL(WELL_KNOWN_PATH, api.upstreamUrl).toString();
+  } catch {
+    wellKnownUrl = `${api.upstreamUrl.replace(/\/+$/, '')}${WELL_KNOWN_PATH}`;
+  }
+  return {
+    id: api.id,
+    name: api.name,
+    description: api.description,
+    upstreamUrl: api.upstreamUrl,
+    upstreamMethod: api.upstreamMethod,
+    price: api.price,
+    walletAddress: api.walletAddress,
+    listed: api.listed,
+    ownershipVerified: api.ownershipVerified,
+    ownershipVerification: {
+      token: api.ownershipToken,
+      methods: ['well-known-file', 'dns-txt'],
+      wellKnownFile: {
+        url: wellKnownUrl,
+        expectedLine: `${DNS_TXT_PREFIX}${api.ownershipToken}`,
+      },
+      dnsTxt: {
+        host,
+        expectedRecord: `${DNS_TXT_PREFIX}${api.ownershipToken}`,
+      },
+    },
+    createdAt: api.createdAt,
+    updatedAt: api.updatedAt,
+  };
+}
+
+export async function createApi(input: CreateApiInput): Promise<OwnerApi> {
+  const now = new Date().toISOString();
+  const id = randomUUID();
+  const ownershipToken = randomUUID().replace(/-/g, '');
+  const record: ApiRecord = {
+    id,
+    publisherId: input.publisherId,
     name: input.name,
-    description: input.description,
+    description: input.description ?? null,
+    upstreamUrl: input.upstreamUrl,
+    upstreamMethod: input.upstreamMethod ?? 'GET',
+    upstreamHeaderValueEnc: input.upstreamHeaderValueEnc ?? null,
+    upstreamQueryValueEnc: input.upstreamQueryValueEnc ?? null,
     price: input.price,
     walletAddress: input.walletAddress,
-    allowedMethods: input.allowedMethods,
-    timeoutMs: clampTimeout(input.timeoutMs),
-    maxResponseBytes: checkedMaxResponseBytes(input.maxResponseBytes),
-    tags: input.tags,
-    payerAllowlist: input.payerAllowlist,
-    payerDenylist: input.payerDenylist,
-    ...encryptedHeader(input.upstreamHeader),
-    ...encryptedQueryParam(input.upstreamQueryParam),
+    ownershipToken,
+    ownershipVerified: false,
+    listed: false,
+    createdAt: now,
+    updatedAt: now,
   };
 
-  if (input.healthPath !== undefined && input.healthPath !== api.healthPath) {
-    Object.assign(changes, { healthPath: input.healthPath }, RESET_HEALTH);
+  await db('apis').insert(record);
+
+  const verified = await verifyOwnership(record.upstreamUrl, ownershipToken);
+  if (verified) {
+    await db('apis')
+      .where({ id })
+      .update({ ownershipVerified: true, listed: true, updatedAt: now });
+    record.ownershipVerified = true;
+    record.listed = true;
   }
 
-  if (input.upstreamUrl !== undefined) {
-    const upstreamUrl = checkedUpstreamUrl(input.upstreamUrl);
-    changes.upstreamUrl = upstreamUrl;
-    if (upstreamUrl !== api.upstreamUrl) Object.assign(changes, RESET_HEALTH);
-    // Ownership was proven for the old origin; a new origin must be proven again.
-    if (new URL(upstreamUrl).origin !== new URL(api.upstreamUrl).origin) {
-      changes.ownershipVerifiedAt = null;
-      changes.listed = false;
-    }
-  }
-
-  if (input.listed !== undefined) {
-    const verified =
-      changes.ownershipVerifiedAt === null ? false : Boolean(api.ownershipVerifiedAt);
-    if (input.listed && !verified) {
-      throw new ApiServiceError(409, "Verify ownership of the upstream before listing this API");
-    }
-    if (input.listed && api.onchainStatus !== "registered") {
-      throw new ApiServiceError(
-        409,
-        `Register this API on-chain before listing it (GET /apis/${api.id}/register/prepare)`,
-      );
-    }
-    changes.listed = input.listed;
-  }
-
-  for (const key of Object.keys(changes) as Array<keyof typeof changes>) {
-    if (changes[key] === undefined) delete changes[key];
-  }
-  if (Object.keys(changes).length === 0) return api;
-
-  const [row] = await db.update(apis).set(changes).where(eq(apis.id, api.id)).returning();
-  invalidateApiCache(api.id);
-  return row;
+  return toOwnerApi(record);
 }
 
-/**
- * Prove the provider controls the upstream origin: it must serve
- * `zentrixpay-verification=<token>` at /.well-known/zentrixpay.txt.
- * On success the API is marked verified, and listed once it is also
- * registered on-chain.
- */
-export async function verifyOwnership(api: ApiRow): Promise<ApiRow> {
-  let body: string;
-  let status: number;
-  try {
-    const res = await sendUpstream({
-      url: new URL(ownershipFileUrl(api.upstreamUrl)),
-      method: "GET",
-      headers: { accept: "text/plain", "user-agent": "ZentrixPay-Verifier/1" },
-      timeoutMs: 5_000,
-      maxResponseBytes: 64 * 1024,
-      allowPrivate: config.PROXY_ALLOW_PRIVATE_UPSTREAMS,
-    });
-    status = res.status;
-    body = res.body.toString("utf8");
-  } catch (err) {
-    throw new ApiServiceError(
-      422,
-      `Could not fetch ${OWNERSHIP_FILE_PATH}: ${(err as Error).message}`,
-    );
-  }
-
-  const expected = ownershipLine(api.ownershipToken);
-  const found = body.split(/\r?\n/).some((line) => line.trim() === expected);
-  if (status !== 200 || !found) {
-    throw new ApiServiceError(
-      422,
-      `${OWNERSHIP_FILE_PATH} must return 200 and contain the line "${expected}"`,
-    );
-  }
-
-  const [row] = await db
-    .update(apis)
-    .set({ ownershipVerifiedAt: new Date(), listed: api.onchainStatus === "registered" })
-    .where(eq(apis.id, api.id))
-    .returning();
-  invalidateApiCache(api.id);
-  return row;
+export async function getApiById(id: string): Promise<ApiRecord | null> {
+  const row = await db<ApiRecord>('apis').where({ id }).first();
+  return row ?? null;
 }
 
-export interface RecordCallInput {
-  id?: string;
-  apiId: string;
-  payerAddress: string;
-  amount: string;
-  charged: boolean;
-  method: string;
-  path: string;
-  responseStatus: number;
-  durationMs: number;
-  txHash?: string | null;
+export async function getOwnerApi(
+  id: string,
+  publisherId: string,
+): Promise<OwnerApi | null> {
+  const row = await db<ApiRecord>('apis')
+    .where({ id, publisherId })
+    .first();
+  return row ? toOwnerApi(row) : null;
 }
 
-export async function recordApiCall(input: RecordCallInput): Promise<void> {
-  await db.insert(apiCalls).values(input);
+export async function listOwnerApis(publisherId: string): Promise<OwnerApi[]> {
+  const rows = await db<ApiRecord>('apis')
+    .where({ publisherId })
+    .orderBy('createdAt', 'desc');
+  return rows.map(toOwnerApi);
 }
 
-// ── Health checks (#35) ──────────────────────────────────────────────────────
-
-/** Listed APIs with a health path, healthy or not (unhealthy ones must be able to recover). */
-export async function listApisForHealthCheck(): Promise<ApiRow[]> {
-  return db
-    .select()
-    .from(apis)
-    .where(and(eq(apis.listed, true), isNotNull(apis.healthPath)));
-}
-
-/** Map an API's healthPath onto its upstream, the same way the proxy maps /api/:id<path>. */
-export function healthCheckUrl(api: ApiRow): URL {
-  const base = new URL(api.upstreamUrl);
-  const raw = api.healthPath ?? "/";
-  const queryStart = raw.indexOf("?");
-  const path = queryStart === -1 ? raw : raw.slice(0, queryStart);
-  const query = queryStart === -1 ? "" : raw.slice(queryStart + 1);
-  const target = new URL(base.origin);
-  target.pathname = `${base.pathname.replace(/\/+$/, "")}${path}`;
-  target.search = [base.search.slice(1), query].filter(Boolean).join("&");
-  return target;
-}
-
-/**
- * Record one health check. A success makes the API healthy at once; it turns
- * unhealthy only after `failureThreshold` consecutive failures.
- */
-export async function recordHealthCheck(
-  api: ApiRow,
-  ok: boolean,
-  failureThreshold: number,
-): Promise<ApiRow> {
-  const now = new Date();
-  const [row] = await db
-    .update(apis)
-    .set(
-      ok
-        ? { healthy: true, healthFailures: 0, lastHealthCheckAt: now }
-        : {
-            healthFailures: sql`${apis.healthFailures} + 1`,
-            healthy: sql`case when ${apis.healthFailures} + 1 >= ${failureThreshold} then false else ${apis.healthy} end`,
-            lastHealthCheckAt: now,
-          },
-    )
-    .where(eq(apis.id, api.id))
-    .returning();
-  if (row && row.healthy !== api.healthy) invalidateApiCache(api.id);
-  return row ?? api;
-}
-
-export async function getApiStats(apiId: string) {
-  const [totals] = await db
-    .select({
-      calls: sql<number>`count(*)::int`,
-      chargedCalls: sql<number>`count(*) filter (where ${apiCalls.charged})::int`,
-      revenue: sql<string>`coalesce(sum(${apiCalls.amount}::numeric) filter (where ${apiCalls.charged}), 0)::text`,
-      uniquePayers: sql<number>`count(distinct ${apiCalls.payerAddress}) filter (where ${apiCalls.charged})::int`,
-      avgDurationMs: sql<number>`coalesce(avg(${apiCalls.durationMs}), 0)::int`,
-      refundedCalls: sql<number>`count(*) filter (where ${apiCalls.refundStatus} = 'refunded')::int`,
-      refunded: sql<string>`coalesce(sum(${apiCalls.refundAmount}::numeric) filter (where ${apiCalls.refundStatus} = 'refunded'), 0)::text`,
-      netRevenue: sql<string>`(coalesce(sum(${apiCalls.amount}::numeric) filter (where ${apiCalls.charged}), 0) - coalesce(sum(${apiCalls.refundAmount}::numeric) filter (where ${apiCalls.refundStatus} = 'refunded'), 0))::text`,
-    })
-    .from(apiCalls)
-    .where(eq(apiCalls.apiId, apiId));
-  return { ...totals, currency: "USDC" };
-}
-
-export async function listRecentCalls(apiId: string, limit: number) {
-  return db
-    .select()
-    .from(apiCalls)
-    .where(eq(apiCalls.apiId, apiId))
-    .orderBy(desc(apiCalls.createdAt))
-    .limit(limit);
-}
-
-/** One data point in a time-series response: calls and revenue for a single calendar day. */
-export interface TimeSeriesPoint {
-  date: string; // ISO date yyyy-mm-dd in UTC
-  calls: number;
-  revenue: string; // USDC, as decimal string
-}
-
-/**
- * Returns one row per UTC calendar day, covering the last `days` days (today
- * inclusive). Days with no calls are filled in with zeros so the caller always
- * gets a contiguous series.
- */
-export async function getApiTimeSeries(
+async function recordChange(
   apiId: string,
-  days: 7 | 30 | 90,
-): Promise<TimeSeriesPoint[]> {
-  const rows = await db
-    .select({
-      date: sql<string>`to_char(date_trunc('day', ${apiCalls.createdAt} at time zone 'UTC'), 'YYYY-MM-DD')`,
-      calls: sql<number>`count(*)::int`,
-      revenue: sql<string>`coalesce(sum(${apiCalls.amount}::numeric) filter (where ${apiCalls.charged}), 0)::text`,
-    })
-    .from(apiCalls)
-    .where(
-      and(
-        eq(apiCalls.apiId, apiId),
-        sql`${apiCalls.createdAt} >= now() - interval '${sql.raw(String(days))} days'`,
-      ),
-    )
-    .groupBy(sql`1`)
-    .orderBy(sql`1`);
-
-  // Build a map so we can fill in missing dates with zeros.
-  const byDate = new Map(rows.map((r) => [r.date, r]));
-
-  const result: TimeSeriesPoint[] = [];
-  const now = new Date();
-  for (let i = days - 1; i >= 0; i--) {
-    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - i));
-    const dateStr = d.toISOString().slice(0, 10);
-    const row = byDate.get(dateStr);
-    result.push({ date: dateStr, calls: row?.calls ?? 0, revenue: row?.revenue ?? "0" });
+  field: string,
+  oldValue: unknown,
+  newValue: unknown,
+  actor: string,
+): Promise<void> {
+  const oldMasked = maskValue(field, oldValue);
+  const newMasked = maskValue(field, newValue);
+  if (oldMasked === newMasked) {
+    return;
   }
-  return result;
+  await db('api_changes').insert({
+    id: randomUUID(),
+    apiId,
+    field,
+    oldValue: oldMasked,
+    newValue: newMasked,
+    actor,
+    createdAt: new Date().toISOString(),
+  });
+}
+
+export async function updateApi(
+  id: string,
+  publisherId: string,
+  input: UpdateApiInput,
+): Promise<OwnerApi | null> {
+  const existing = await db<ApiRecord>('apis')
+    .where({ id, publisherId })
+    .first();
+  if (!existing) {
+    return null;
+  }
+
+  const updates: Partial<ApiRecord> = {};
+  const changes: Array<{ field: string; oldValue: unknown; newValue: unknown }> =
+    [];
+
+  for (const field of AUDITED_FIELDS) {
+    if (!(field in input)) {
+      continue;
+    }
+    const newValue = input[field];
+    const oldValue = existing[field as keyof ApiRecord];
+    if (normalizeForCompare(oldValue) !== normalizeForCompare(newValue)) {
+      updates[field as keyof ApiRecord] = newValue as never;
+      changes.push({ field, oldValue, newValue });
+    }
+  }
+
+  if (changes.length === 0) {
+    return toOwnerApi(existing);
+  }
+
+  const now = new Date().toISOString();
+  updates.updatedAt = now;
+
+  // If the upstream URL changed, ownership must be re-verified.
+  const upstreamChanged = changes.some((c) => c.field === 'upstreamUrl');
+  if (upstreamChanged) {
+    const verified = await verifyOwnership(
+      (updates.upstreamUrl as string) ?? existing.upstreamUrl,
+      existing.ownershipToken,
+    );
+    updates.ownershipVerified = verified;
+    updates.listed = verified;
+  }
+
+  await db('apis').where({ id }).update(updates);
+
+  for (const change of changes) {
+    await recordChange(
+      id,
+      change.field,
+      change.oldValue,
+      change.newValue,
+      publisherId,
+    );
+  }
+
+  const updated = await db<ApiRecord>('apis').where({ id }).first();
+  return updated ? toOwnerApi(updated) : null;
+}
+
+export async function listApiChanges(
+  apiId: string,
+): Promise<ApiChangeRecord[]> {
+  const rows = await db<ApiChangeRecord>('api_changes')
+    .where({ apiId })
+    .orderBy('createdAt', 'desc');
+  return rows;
+}
+
+export async function getApiChangesForOwner(
+  apiId: string,
+  publisherId: string,
+): Promise<ApiChangeRecord[] | null> {
+  const existing = await db<ApiRecord>('apis')
+    .where({ id: apiId, publisherId })
+    .first();
+  if (!existing) {
+    return null;
+  }
+  return listApiChanges(apiId);
+}
+
+export async function listApisForOwnershipRecheck(): Promise<ApiRecord[]> {
+  return db<ApiRecord>('apis').where({ listed: true });
+}
+
+export async function reverifyOwnership(api: ApiRecord): Promise<boolean> {
+  const verified = await verifyOwnership(api.upstreamUrl, api.ownershipToken);
+  const now = new Date().toISOString();
+
+  if (verified) {
+    if (!api.ownershipVerified) {
+      await db('apis')
+        .where({ id: api.id })
+        .update({ ownershipVerified: true, updatedAt: now });
+    }
+    return true;
+  }
+
+  // Token disappeared: unlist and notify.
+  await db('apis')
+    .where({ id: api.id })
+    .update({ ownershipVerified: false, listed: false, updatedAt: now });
+
+  logger.warn(
+    { apiId: api.id, publisherId: api.publisherId },
+    'Ownership token no longer verifiable; API unlisted',
+  );
+
+  try {
+    await notificationService.notifyOwnershipLost({
+      apiId: api.id,
+      publisherId: api.publisherId,
+      apiName: api.name,
+      upstreamUrl: api.upstreamUrl,
+    });
+  } catch (err) {
+    logger.error(
+      { err, apiId: api.id },
+      'Failed to send ownership-lost notification',
+    );
+  }
+
+  return false;
+}
+
+export async function runOwnershipRecheck(): Promise<{
+  checked: number;
+  unlisted: number;
+}> {
+  const apis = await listApisForOwnershipRecheck();
+  let unlisted = 0;
+  for (const api of apis) {
+    const ok = await reverifyOwnership(api);
+    if (!ok) {
+      unlisted += 1;
+    }
+  }
+  return { checked: apis.length, unlisted };
+}
+
+let recheckTimer: NodeJS.Timeout | null = null;
+
+export function startOwnershipRecheckSchedule(
+  intervalMs: number,
+): void {
+  if (recheckTimer) {
+    clearInterval(recheckTimer);
+  }
+  recheckTimer = setInterval(() => {
+    runOwnershipRecheck().catch((err) => {
+      logger.error({ err }, 'Ownership recheck run failed');
+    });
+  }, intervalMs);
+  if (typeof recheckTimer.unref === 'function') {
+    recheckTimer.unref();
+  }
+}
+
+export function stopOwnershipRecheckSchedule(): void {
+  if (recheckTimer) {
+    clearInterval(recheckTimer);
+    recheckTimer = null;
+  }
 }
