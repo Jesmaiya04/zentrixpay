@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import express, {
   Router,
   type NextFunction,
@@ -12,7 +12,10 @@ import { payeeSignatureAuth } from "../middleware/payeeSignatureAuth.js";
 import { validate } from "../middleware/validate.js";
 import { publishIpRateLimit, publishWalletRateLimit } from "../middleware/rateLimiters.js";
 import { apiPaywall, checkPayerAccess, loadProxiedApi } from "../middleware/apiPaywall.js";
+import { spendSignedApiCredit } from "../middleware/apiCreditSpend.js";
 import {
+  apiCreditBalanceQuerySchema,
+  apiCreditPurchaseSchema,
   apiCatalogQuerySchema,
   apiStatsQuerySchema,
   createApiSchema,
@@ -40,6 +43,9 @@ import {
   verifyOwnership,
   type ApiRow,
 } from "../services/apiService.js";
+import { getApiCreditBalance, purchaseApiCredits } from "../services/apiCredits.js";
+import { apiCreditPurchaseReference } from "../lib/apiCreditSignature.js";
+import { deliverChargedCallWebhook } from "../services/webhookService.js";
 import {
   confirmApiPrice,
   confirmApiRegistration,
@@ -56,10 +62,22 @@ import {
   type StoredProxyResponse,
 } from "../lib/idempotency.js";
 import { decryptSecret } from "../utils/secretBox.js";
+import { stroopsToUsdc, usdcToStroops } from "../utils/usdc.js";
 import { getLogger } from "../lib/logger.js";
 import { config } from "../config.js";
 
 const router: RouterType = Router();
+
+function apiCreditBundlePrice(api: ApiRow, calls: number): string {
+  const highestCallPrice = (api.priceRules ?? []).reduce(
+    (highest, rule) => {
+      const rulePrice = usdcToStroops(rule.price);
+      return rulePrice > highest ? rulePrice : highest;
+    },
+    usdcToStroops(api.price),
+  );
+  return stroopsToUsdc(highestCallPrice * BigInt(calls));
+}
 
 function sendServiceError(res: Response, err: unknown): void {
   if (err instanceof ApiServiceError) {
@@ -491,6 +509,74 @@ function proxyIdempotency(req: Request, res: Response, next: NextFunction) {
 
 const UPSTREAM_ERROR_STATUS = { blocked: 502, network: 502, too_large: 502, timeout: 504 } as const;
 
+async function loadListedCreditApi(req: Request, res: Response, next: NextFunction) {
+  try {
+    const api = await getApiById(req.params.id as string);
+    if (!api || !api.listed) {
+      res.status(404).json({ error: "API not found" });
+      return;
+    }
+    res.locals.api = api;
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
+// POST /apis/:id/credits/purchase — buy a prepaid bundle with one x402 payment.
+router.post(
+  "/apis/:id/credits/purchase",
+  loadListedCreditApi,
+  validate(apiCreditPurchaseSchema),
+  apiPaywall({
+    priceForRequest: (req, api) =>
+      apiCreditBundlePrice(api, (req.body as { calls: number }).calls),
+  }),
+  async (req, res) => {
+    const api = res.locals.api as ApiRow;
+    const payment = paymentHeader(req);
+    const payer =
+      settlementFrom(res).payer ?? payerFromPayment(payment).address;
+    if (!payment || !payer) {
+      res.status(502).json({ error: "Settled payment did not identify the purchasing wallet" });
+      return;
+    }
+
+    const result = await purchaseApiCredits({
+      apiId: api.id,
+      walletAddress: payer,
+      calls: (req.body as { calls: number }).calls,
+      reference: apiCreditPurchaseReference(settlementFrom(res).transaction, payment),
+    });
+    if (result.duplicate) {
+      res.status(409).json({
+        error: "This payment has already been credited",
+        apiId: api.id,
+        balance: result.balance,
+      });
+      return;
+    }
+    res.status(201).json({
+      apiId: api.id,
+      walletAddress: payer,
+      calls: (req.body as { calls: number }).calls,
+      balance: result.balance,
+    });
+  },
+);
+
+// GET /apis/:id/credits/balance?walletAddress=G... — read an API-specific balance.
+router.get("/apis/:id/credits/balance", loadListedCreditApi, async (req, res) => {
+  const parsed = apiCreditBalanceQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.format() });
+    return;
+  }
+  const api = res.locals.api as ApiRow;
+  const balance = await getApiCreditBalance(api.id, parsed.data.walletAddress);
+  res.json({ apiId: api.id, walletAddress: parsed.data.walletAddress, balance });
+});
+
 async function proxyHandler(req: Request, res: Response) {
   const api = res.locals.api as ApiRow;
   const segments = (req.params.path as unknown as string[] | undefined) ?? [];
@@ -521,26 +607,26 @@ async function proxyHandler(req: Request, res: Response) {
   res.on("finish", () => {
     const settlement = settlementFrom(res);
     const charged = res.statusCode < 400;
-    recordApiCall({
-      apiId: api.id,
-      payerAddress: payerFrom(req, settlement),
-      amount: api.price,
-      charged,
-      txHash: charged ? (settlement.transaction ?? null) : null,
+    const callId = randomUUID();
+    const call = {
+      callId,
+      payerAddress:
+        (res.locals.creditPayer as string | undefined) ?? payerFrom(req, settlement),
+      amount: (res.locals.apiCallPrice as string | undefined) ?? api.price,
       method: req.method,
       path:
         target.pathname.slice(new URL(api.upstreamUrl).pathname.replace(/\/+$/, "").length) || "/",
       responseStatus: res.statusCode,
       durationMs: Date.now() - started,
     };
-    const charged = res.statusCode < 400;
-    if (charged) deliverChargedCallWebhook(api, { ...call, amount: api.price });
+    if (charged) deliverChargedCallWebhook(api, call);
     recordApiCall({
-      id: call.callId,
+      id: callId,
       apiId: api.id,
       payerAddress: call.payerAddress,
-      amount: api.price,
+      amount: call.amount,
       charged,
+      txHash: charged ? (settlement.transaction ?? null) : null,
       method: call.method,
       path: call.path,
       responseStatus: call.responseStatus,
@@ -581,7 +667,9 @@ async function proxyHandler(req: Request, res: Response) {
   const responseHeaders: StoredProxyResponse["headers"] = {};
   for (const [name, value] of Object.entries(filterResponseHeaders(upstream.headers))) {
     responseHeaders[name] =
-      name === "location" && typeof value === "string" ? rewriteLocation(value, api) : value;
+      typeof value === "string"
+        ? rewriteResponseHeader(name, value, api, secrets)
+        : value.map((part) => rewriteResponseHeader(name, part, api, secrets));
   }
   // Kept for Idempotency-Key replay once the call is known to be charged.
   res.locals.proxyResponse = {
@@ -604,6 +692,7 @@ router.all(
   loadProxiedApi,
   express.raw({ type: () => true, limit: config.PROXY_MAX_REQUEST_BODY }),
   checkPayerAccess,
+  spendSignedApiCredit,
   proxyIdempotency,
   apiPaywall,
   proxyHandler,

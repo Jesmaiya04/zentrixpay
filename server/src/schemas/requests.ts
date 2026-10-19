@@ -114,6 +114,38 @@ const usdcPrice = z
   .regex(/^\d+(\.\d{1,7})?$/, "price must be a USDC amount with at most 7 decimals")
   .refine((v) => Number(v) > 0, "price must be greater than 0");
 
+const apiPriceRule = z
+  .object({
+    method: z.enum(API_METHODS),
+    pathPattern: z
+      .string()
+      .min(1)
+      .max(512)
+      .refine((path) => path.startsWith("/") && !/[?#\\\r\n]/.test(path), {
+        message: "pathPattern must be an absolute path without query or fragment",
+      }),
+    price: usdcPrice,
+  })
+  .strict();
+
+const apiPriceRules = z
+  .array(apiPriceRule)
+  .max(100)
+  .superRefine((rules, ctx) => {
+    const seen = new Set<string>();
+    rules.forEach((rule, index) => {
+      const key = `${rule.method}:${rule.pathPattern}`;
+      if (seen.has(key)) {
+        ctx.addIssue({
+          code: "custom",
+          message: "method and pathPattern must be unique",
+          path: [index, "pathPattern"],
+        });
+      }
+      seen.add(key);
+    });
+  });
+
 const stellarAddress = z
   .string()
   .regex(/^G[A-Z2-7]{55}$/, "walletAddress must be a Stellar public key (G...)");
@@ -179,6 +211,7 @@ export const createApiSchema = z
     description: z.string().max(2000).optional(),
     upstreamUrl: z.url(),
     price: usdcPrice,
+    priceRules: apiPriceRules.default([]),
     walletAddress: stellarAddress.optional(),
     allowedMethods: z.array(z.enum(API_METHODS)).min(1).default(["GET"]),
     upstreamHeader: upstreamHeader.optional(),
@@ -201,6 +234,7 @@ export const updateApiSchema = z
     description: z.string().max(2000).nullable().optional(),
     upstreamUrl: z.url().optional(),
     price: usdcPrice.optional(),
+    priceRules: apiPriceRules.nullable().optional(),
     walletAddress: stellarAddress.optional(),
     allowedMethods: z.array(z.enum(API_METHODS)).min(1).optional(),
     upstreamHeader: upstreamHeader.nullable().optional(),
@@ -215,6 +249,18 @@ export const updateApiSchema = z
     payerAllowlist: payerList.nullable().optional(),
     payerDenylist: payerList.optional(),
     listed: z.boolean().optional(),
+  })
+  .strict();
+
+export const apiCreditPurchaseSchema = z
+  .object({
+    calls: z.number().int().min(1).max(10_000),
+  })
+  .strict();
+
+export const apiCreditBalanceQuerySchema = z
+  .object({
+    walletAddress: stellarAddress,
   })
   .strict();
 

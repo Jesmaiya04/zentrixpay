@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { and, asc, desc, eq, ilike, isNull, or, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
-import { apiCalls, apis } from "../db/schema.js";
+import { apiCalls, apis, type ApiPriceRule } from "../db/schema.js";
 import { config } from "../config.js";
 import { encryptSecret } from "../utils/secretBox.js";
 import { validateUpstreamUrl } from "../lib/upstreamGuard.js";
@@ -44,6 +44,7 @@ export function toPublicApi(api: ApiRow) {
     currency: "USDC",
     walletAddress: api.walletAddress,
     allowedMethods: api.allowedMethods,
+    priceRules: api.priceRules ?? [],
     tags: api.tags,
     proxyUrl: proxyUrlOf(api),
     openapiUrl: api.openapiSpec ? `${config.BASE_URL}/apis/${api.id}/openapi.json` : null,
@@ -178,6 +179,7 @@ export interface CreateApiInput {
   description?: string;
   upstreamUrl: string;
   price: string;
+  priceRules?: ApiPriceRule[];
   walletAddress: string;
   allowedMethods: string[];
   upstreamHeader?: { name: string; value: string };
@@ -201,6 +203,7 @@ export async function createApi(input: CreateApiInput): Promise<ApiRow> {
       description: input.description,
       upstreamUrl: checkedUpstreamUrl(input.upstreamUrl),
       price: input.price,
+      priceRules: input.priceRules ?? [],
       walletAddress: input.walletAddress,
       allowedMethods: input.allowedMethods,
       timeoutMs: clampTimeout(input.timeoutMs),
@@ -323,6 +326,7 @@ export interface UpdateApiInput {
   description?: string | null;
   upstreamUrl?: string;
   price?: string;
+  priceRules?: ApiPriceRule[] | null;
   walletAddress?: string;
   allowedMethods?: string[];
   upstreamHeader?: { name: string; value: string } | null;
@@ -360,6 +364,7 @@ export async function updateApi(api: ApiRow, input: UpdateApiInput): Promise<Api
     name: input.name,
     description: input.description,
     price: input.price,
+    priceRules: input.priceRules === null ? [] : input.priceRules,
     walletAddress: input.walletAddress,
     allowedMethods: input.allowedMethods,
     timeoutMs: clampTimeout(input.timeoutMs),

@@ -72,6 +72,14 @@ export function createFreighterSigner(
   };
 }
 
+export function createFreighterX402Client(address: string): x402Client {
+  const preset = resolveNetworkPreset();
+  return new x402Client().register(
+    preset.x402Network as Network,
+    new ExactStellarScheme(createFreighterSigner(address, preset.networkPassphrase)),
+  );
+}
+
 /** A receipt returned by a paid link resource. */
 export interface PurchaseReceipt {
   paymentId?: string;
@@ -144,12 +152,7 @@ export async function purchaseResource(
   accessUrl: string,
   address: string,
 ): Promise<PurchaseResult> {
-  const preset = resolveNetworkPreset();
-  const signer = createFreighterSigner(address, preset.networkPassphrase);
-  const client = new x402Client().register(
-    preset.x402Network as Network,
-    new ExactStellarScheme(signer),
-  );
+  const client = createFreighterX402Client(address);
   const paidFetch = wrapFetchWithPayment(fetch, client);
 
   let res: Response;

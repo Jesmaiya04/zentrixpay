@@ -1,6 +1,8 @@
 import { x402Client, wrapFetchWithPayment, decodePaymentResponseHeader } from "@x402/fetch";
 import { ExactStellarScheme } from "@x402/stellar";
 import type { PaymentRequirements, PaymentResponse } from "@x402/core/types";
+import { createFreighterX402Client } from "./x402Buy.js";
+import { explorerTxUrl } from "./stellarExplorer.js";
 
 /**
  * Network identifier for Stellar testnet, as expected by @x402/stellar.
@@ -118,6 +120,41 @@ export async function x402Call(
     headers: responseHeaders,
     body: parsed,
     payment,
+  };
+}
+
+export async function callPaidApi(
+  proxyUrl: string,
+  walletAddress: string,
+  options: {
+    method: string;
+    path: string;
+    body?: string;
+    headers?: Record<string, string>;
+    price: string;
+  },
+): Promise<{
+  status: number;
+  charged: boolean;
+  price: string;
+  contentType: string;
+  body: unknown;
+  explorerUrl?: string;
+}> {
+  const client = createFreighterX402Client(walletAddress);
+  const result = await x402Call(client, proxyUrl, options.path, {
+    method: options.method,
+    body: options.body,
+    headers: options.headers,
+  });
+  const transaction = result.payment?.transaction;
+  return {
+    status: result.status,
+    charged: result.status < 400 && Boolean(result.payment),
+    price: options.price,
+    contentType: result.headers["content-type"] ?? "",
+    body: result.body,
+    explorerUrl: transaction ? explorerTxUrl(transaction) : undefined,
   };
 }
 
