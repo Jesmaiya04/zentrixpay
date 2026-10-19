@@ -135,6 +135,11 @@ const envSchema = z.object({
     .enum(["true", "false"])
     .default("false")
     .transform((v) => v === "true"),
+
+  // Issue #33: IP rate limiter on /api/:id — rejects 402-spam before DB is touched.
+  // Max unpaid requests per IP per window; set to 0 to disable.
+  PROXY_402_RATE_LIMIT_MAX: z.coerce.number().int().min(0).default(60),
+  PROXY_402_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
   // How long a proxied API's row is cached between DB lookups (#34). Edits
   // invalidate the entry, so this only bounds staleness across replicas.
   PROXY_API_CACHE_TTL_MS: z.coerce.number().int().min(0).default(5_000),
