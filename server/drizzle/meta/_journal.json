@@ -78,6 +78,13 @@
       "when": 1780400000000,
       "tag": "0010_api_archive_tags",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1792411300000,
+      "tag": "0011_api_price_rules_credits",
+      "breakpoints": true
     }
   ]
 }

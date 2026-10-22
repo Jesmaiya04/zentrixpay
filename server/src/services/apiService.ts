@@ -1,25 +1,27 @@
-import { promises as dnsPromises } from 'node:dns';
-import { randomUUID } from 'node:crypto';
-import { db } from '../db';
-import { logger } from '../logger';
-import { notificationService } from './notificationService';
+import { randomBytes } from "node:crypto";
+import { and, asc, desc, eq, gt, ilike, isNotNull, isNull, or, sql } from "drizzle-orm";
+import { db } from "../db/client.js";
+import { apiCalls, apis } from "../db/schema.js";
+import { config, upstreamKeyRing } from "../config.js";
+import { encryptSecret } from "../utils/secretBox.js";
+import { validateUpstreamUrl } from "../lib/upstreamGuard.js";
+import { sendUpstream } from "../lib/upstreamClient.js";
+import { createTtlCache } from "../lib/ttlCache.js";
+import type { apiCatalogSortValues } from "../schemas/requests.js";
 
-export interface ApiRecord {
-  id: string;
-  publisherId: string;
-  name: string;
-  description: string | null;
-  upstreamUrl: string;
-  upstreamMethod: string;
-  upstreamHeaderValueEnc: string | null;
-  upstreamQueryValueEnc: string | null;
-  price: string;
-  walletAddress: string;
-  ownershipToken: string;
-  ownershipVerified: boolean;
-  listed: boolean;
-  createdAt: string;
-  updatedAt: string;
+export type ApiRow = typeof apis.$inferSelect;
+
+// Hot proxied APIs are looked up on every call (#34). Every write to an API
+// goes through this module and invalidates its entry, so edits apply at once
+// in this process; other replicas see them within the TTL.
+const apiCache = createTtlCache<ApiRow>({
+  defaultTtlMs: config.PROXY_API_CACHE_TTL_MS,
+  maxSize: 1_000,
+  cacheName: "proxied_api",
+});
+
+export function invalidateApiCache(id: string): void {
+  apiCache.delete(id);
 }
 
 export interface ApiChangeRecord {
@@ -32,27 +34,31 @@ export interface ApiChangeRecord {
   createdAt: string;
 }
 
-export interface OwnerApi {
-  id: string;
-  name: string;
-  description: string | null;
-  upstreamUrl: string;
-  upstreamMethod: string;
-  price: string;
-  walletAddress: string;
-  listed: boolean;
-  ownershipVerified: boolean;
-  ownershipVerification: {
-    token: string;
-    methods: string[];
-    wellKnownFile: {
-      url: string;
-      expectedLine: string;
-    };
-    dnsTxt: {
-      host: string;
-      expectedRecord: string;
-    };
+/** What anyone may see about an API. Never includes the upstream URL or secret. */
+export function toPublicApi(api: ApiRow) {
+  return {
+    id: api.id,
+    name: api.name,
+    description: api.description,
+    price: api.price,
+    currency: "USDC",
+    walletAddress: api.walletAddress,
+    allowedMethods: api.allowedMethods,
+    priceRules: api.priceRules ?? [],
+    tags: api.tags,
+    // Issue #30: callers can see whether a pass is offered and at what price.
+    passPrice: api.passPrice ?? null,
+    // Issue #32: free calls per day this provider offers to new callers.
+    freeCallsPerDay: api.freeCallsPerDay,
+    proxyUrl: proxyUrlOf(api),
+    openapiUrl: api.openapiSpec ? `${config.BASE_URL}/apis/${api.id}/openapi.json` : null,
+    // Where callers can check price and payee for themselves.
+    onchain: {
+      registered: api.onchainStatus === "registered",
+      contractId: config.REGISTRY_CONTRACT_ID,
+      txHash: api.onchainTxHash,
+    },
+    createdAt: api.createdAt,
   };
   createdAt: string;
   updatedAt: string;
@@ -81,8 +87,28 @@ export interface UpdateApiInput {
   walletAddress?: string;
 }
 
-const WELL_KNOWN_PATH = '/.well-known/zentrixpay.txt';
-const DNS_TXT_PREFIX = 'zentrixpay-verification=';
+/** What the owning provider sees. Includes the upstream URL but never the secret value. */
+export function toOwnerApi(api: ApiRow) {
+  return {
+    ...toPublicApi(api),
+    upstreamUrl: api.upstreamUrl,
+    upstreamHeaderName: api.upstreamHeaderName,
+    hasUpstreamSecret: Boolean(api.upstreamHeaderValueEnc),
+    upstreamQueryParamName: api.upstreamQueryName,
+    hasUpstreamQuerySecret: Boolean(api.upstreamQueryValueEnc),
+    timeoutMs: api.timeoutMs,
+    payerAllowlist: api.payerAllowlist,
+    payerDenylist: api.payerDenylist,
+    listed: api.listed,
+    streamingEnabled: api.streamingEnabled,
+    onchainStatus: api.onchainStatus,
+    ownershipVerified: Boolean(api.ownershipVerifiedAt),
+    ownershipVerification: {
+      url: ownershipFileUrl(api.upstreamUrl),
+      expectedContent: ownershipLine(api.ownershipToken),
+    },
+  };
+}
 
 // Fields that are audited when changed. Secrets are masked in the audit log.
 const AUDITED_FIELDS: Array<keyof UpdateApiInput> = [
@@ -130,45 +156,34 @@ function maskValue(field: string, value: unknown): string | null {
   return String(value);
 }
 
-function normalizeForCompare(value: unknown): string | null {
-  if (value === undefined || value === null) {
-    return null;
-  }
-  return String(value);
-}
-
-function getUpstreamHost(upstreamUrl: string): string {
-  try {
-    return new URL(upstreamUrl).hostname;
-  } catch {
-    return upstreamUrl;
-  }
-}
-
-async function checkWellKnownFile(
-  upstreamUrl: string,
-  token: string,
-): Promise<boolean> {
-  try {
-    const url = new URL(WELL_KNOWN_PATH, upstreamUrl);
-    const response = await fetch(url.toString(), {
-      method: 'GET',
-      redirect: 'follow',
-    });
-    if (!response.ok) {
-      return false;
-    }
-    const body = await response.text();
-    const expectedLine = `${DNS_TXT_PREFIX}${token}`;
-    const lines = body.split(/\r?\n/).map((line) => line.trim());
-    return lines.includes(expectedLine) || body.trim() === expectedLine;
-  } catch (err) {
-    logger.warn(
-      { err, upstreamUrl },
-      'Failed to check well-known ownership file',
+/** Returns the active key ring, or throws 503 if no key is configured. */
+function activeKeyRing() {
+  if (upstreamKeyRing.length === 0) {
+    throw new ApiServiceError(
+      503,
+      "This server cannot store upstream secrets (UPSTREAM_SECRET_KEY / UPSTREAM_SECRET_KEYS is not configured)",
     );
-    return false;
   }
+  return upstreamKeyRing;
+}
+
+function encryptedHeader(header: { name: string; value: string } | null | undefined) {
+  if (header === undefined) return {};
+  if (header === null) return { upstreamHeaderName: null, upstreamHeaderValueEnc: null };
+  return {
+    upstreamHeaderName: header.name.toLowerCase(),
+    upstreamHeaderValueEnc: encryptSecret(header.value, activeKeyRing()),
+  };
+}
+
+function encryptedQueryParam(param: { name: string; value: string } | null | undefined) {
+  if (param === undefined) return {};
+  if (param === null) return { upstreamQueryName: null, upstreamQueryValueEnc: null };
+  // Query parameter names are case-sensitive, so the name is kept as given.
+  return {
+    upstreamQueryName: param.name,
+    upstreamQueryValueEnc: encryptSecret(param.value, activeKeyRing()),
+  };
 }
 
 async function checkDnsTxt(upstreamUrl: string, token: string): Promise<boolean> {
@@ -257,16 +272,60 @@ export async function createApi(input: CreateApiInput): Promise<OwnerApi> {
     updatedAt: now,
   };
 
-  await db('apis').insert(record);
+export interface CreateApiInput {
+  publisherId: string;
+  name: string;
+  description?: string;
+  upstreamUrl: string;
+  price: string;
+  priceRules?: ApiPriceRule[];
+  walletAddress: string;
+  allowedMethods: string[];
+  upstreamHeader?: { name: string; value: string };
+  upstreamQueryParam?: { name: string; value: string };
+  openapiSpec?: string | Record<string, unknown>;
+  timeoutMs?: number;
+  maxResponseBytes?: number;
+  webhook?: { url: string; secret: string };
+  healthPath?: string;
+  tags: string[];
+  payerAllowlist?: string[];
+  payerDenylist?: string[];
+  /** Issue #30: price of a time-limited access pass (undefined = passes not offered). */
+  passPrice?: string;
+  /** Issue #32: free calls per wallet per day before the paywall applies (0 = disabled). */
+  freeCallsPerDay?: number;
+}
 
-  const verified = await verifyOwnership(record.upstreamUrl, ownershipToken);
-  if (verified) {
-    await db('apis')
-      .where({ id })
-      .update({ ownershipVerified: true, listed: true, updatedAt: now });
-    record.ownershipVerified = true;
-    record.listed = true;
-  }
+export async function createApi(input: CreateApiInput): Promise<ApiRow> {
+  const [row] = await db
+    .insert(apis)
+    .values({
+      publisherId: input.publisherId,
+      name: input.name,
+      description: input.description,
+      upstreamUrl: checkedUpstreamUrl(input.upstreamUrl),
+      price: input.price,
+      priceRules: input.priceRules ?? [],
+      walletAddress: input.walletAddress,
+      allowedMethods: input.allowedMethods,
+      timeoutMs: clampTimeout(input.timeoutMs),
+      maxResponseBytes: checkedMaxResponseBytes(input.maxResponseBytes),
+      healthPath: input.healthPath,
+      tags: input.tags,
+      payerAllowlist: input.payerAllowlist ?? null,
+      payerDenylist: input.payerDenylist ?? [],
+      passPrice: input.passPrice ?? null,
+      freeCallsPerDay: input.freeCallsPerDay ?? 0,
+      ownershipToken: randomBytes(16).toString("hex"),
+      openapiSpec: checkedOpenApiSpec(input.openapiSpec),
+      streamingEnabled: input.streamingEnabled ?? false,
+      ...encryptedHeader(input.upstreamHeader),
+      ...encryptedQueryParam(input.upstreamQueryParam),
+    })
+    .returning();
+  return row;
+}
 
   return toOwnerApi(record);
 }
@@ -293,39 +352,79 @@ export async function listOwnerApis(publisherId: string): Promise<OwnerApi[]> {
   return rows.map(toOwnerApi);
 }
 
-async function recordChange(
-  apiId: string,
-  field: string,
-  oldValue: unknown,
-  newValue: unknown,
-  actor: string,
-): Promise<void> {
-  const oldMasked = maskValue(field, oldValue);
-  const newMasked = maskValue(field, newValue);
-  if (oldMasked === newMasked) {
-    return;
-  }
-  await db('api_changes').insert({
-    id: randomUUID(),
-    apiId,
-    field,
-    oldValue: oldMasked,
-    newValue: newMasked,
-    actor,
-    createdAt: new Date().toISOString(),
-  });
+/** Soft-delete: unlist and hide the API everywhere. Its call history is kept for stats. */
+export async function archiveApi(api: ApiRow): Promise<ApiRow> {
+  const [row] = await db
+    .update(apis)
+    .set({ archivedAt: new Date(), listed: false })
+    .where(eq(apis.id, api.id))
+    .returning();
+  return row;
 }
 
-export async function updateApi(
-  id: string,
-  publisherId: string,
-  input: UpdateApiInput,
-): Promise<OwnerApi | null> {
-  const existing = await db<ApiRecord>('apis')
-    .where({ id, publisherId })
-    .first();
-  if (!existing) {
-    return null;
+export interface UpdateApiInput {
+  name?: string;
+  description?: string | null;
+  upstreamUrl?: string;
+  price?: string;
+  priceRules?: ApiPriceRule[] | null;
+  walletAddress?: string;
+  allowedMethods?: string[];
+  upstreamHeader?: { name: string; value: string } | null;
+  upstreamQueryParam?: { name: string; value: string } | null;
+  openapiSpec?: string | Record<string, unknown> | null;
+  timeoutMs?: number | null;
+  maxResponseBytes?: number | null;
+  webhook?: { url: string; secret: string } | null;
+  healthPath?: string | null;
+  tags?: string[];
+  payerAllowlist?: string[] | null;
+  payerDenylist?: string[];
+  listed?: boolean;
+  /** Issue #30: null disables passes; a new price enables / reprices them. */
+  passPrice?: string | null;
+  /** Issue #32: 0 disables free calls. */
+  freeCallsPerDay?: number;
+}
+
+export async function updateApi(api: ApiRow, input: UpdateApiInput): Promise<ApiRow> {
+  // Once anchored on-chain, price and payee change only through the registry
+  // so the on-chain record never drifts from what callers are charged.
+  if (api.onchainStatus === "registered" || api.onchainStatus === "pending") {
+    if (input.price !== undefined && input.price !== api.price) {
+      throw new ApiServiceError(
+        409,
+        `This API's price is anchored on-chain; change it with POST /apis/${api.id}/price/prepare`,
+      );
+    }
+    if (input.walletAddress !== undefined && input.walletAddress !== api.walletAddress) {
+      throw new ApiServiceError(
+        409,
+        "The payout wallet of an API registered on-chain cannot change",
+      );
+    }
+  }
+
+  const changes: Partial<typeof apis.$inferInsert> = {
+    name: input.name,
+    description: input.description,
+    price: input.price,
+    priceRules: input.priceRules === null ? [] : input.priceRules,
+    walletAddress: input.walletAddress,
+    allowedMethods: input.allowedMethods,
+    timeoutMs: clampTimeout(input.timeoutMs),
+    maxResponseBytes: checkedMaxResponseBytes(input.maxResponseBytes),
+    tags: input.tags,
+    payerAllowlist: input.payerAllowlist,
+    payerDenylist: input.payerDenylist,
+    passPrice: input.passPrice,
+    freeCallsPerDay: input.freeCallsPerDay,
+    ...encryptedHeader(input.upstreamHeader),
+    ...encryptedQueryParam(input.upstreamQueryParam),
+  };
+
+  if (input.healthPath !== undefined && input.healthPath !== api.healthPath) {
+    Object.assign(changes, { healthPath: input.healthPath }, RESET_HEALTH);
   }
 
   const updates: Partial<ApiRecord> = {};
@@ -400,8 +499,91 @@ export async function getApiChangesForOwner(
   return listApiChanges(apiId);
 }
 
-export async function listApisForOwnershipRecheck(): Promise<ApiRecord[]> {
-  return db<ApiRecord>('apis').where({ listed: true });
+// ── Access passes (#30) ──────────────────────────────────────────────────────
+
+export interface CreatePassInput {
+  apiId: string;
+  payerAddress: string;
+  /** USDC amount paid for the pass. */
+  amount: string;
+  /** Settlement transaction hash. */
+  txHash: string | null;
+  /** Pass duration in milliseconds. */
+  durationMs: number;
+}
+
+/**
+ * Record a newly purchased access pass. The pass is immediately active and
+ * expires after `durationMs` from now.
+ */
+export async function createApiPass(input: CreatePassInput) {
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + input.durationMs);
+  const [row] = await db
+    .insert(apiPasses)
+    .values({
+      apiId: input.apiId,
+      payerAddress: input.payerAddress,
+      amount: input.amount,
+      txHash: input.txHash,
+      activeFrom: now,
+      expiresAt,
+    })
+    .returning();
+  return row;
+}
+
+/**
+ * Find the most-recently purchased active pass for a payer + API combination.
+ * Returns null when no active pass exists.
+ */
+export async function getActivePass(apiId: string, payerAddress: string) {
+  const now = new Date();
+  const [row] = await db
+    .select()
+    .from(apiPasses)
+    .where(
+      and(
+        eq(apiPasses.apiId, apiId),
+        eq(apiPasses.payerAddress, payerAddress),
+        gt(apiPasses.expiresAt, now),
+        sql`${apiPasses.activeFrom} <= now()`,
+      ),
+    )
+    .orderBy(desc(apiPasses.expiresAt))
+    .limit(1);
+  return row ?? null;
+}
+
+// ── Free calls quota (#32) ───────────────────────────────────────────────────
+
+/**
+ * Count the free (uncharged) calls a payer has already made to an API today
+ * (UTC calendar day).
+ */
+export async function countFreeCallsToday(apiId: string, payerAddress: string): Promise<number> {
+  const [row] = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(apiCalls)
+    .where(
+      and(
+        eq(apiCalls.apiId, apiId),
+        eq(apiCalls.payerAddress, payerAddress),
+        eq(apiCalls.charged, false),
+        sql`${apiCalls.createdAt} >= date_trunc('day', now() at time zone 'UTC')`,
+      ),
+    );
+  return row?.count ?? 0;
+}
+
+// ── Health checks (#35) ──────────────────────────────────────────────────────
+
+/** Listed APIs with a health path, healthy or not (unhealthy ones must be able to recover). */
+export async function listApisForHealthCheck(): Promise<ApiRow[]> {
+  return db
+    .select()
+    .from(apis)
+    .where(and(eq(apis.listed, true), isNotNull(apis.healthPath)));
 }
 
 export async function reverifyOwnership(api: ApiRecord): Promise<boolean> {

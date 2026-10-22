@@ -36,6 +36,10 @@ const STRIP_REQUEST = new Set([
 const STRIP_RESPONSE = new Set([
   ...HOP_BY_HOP,
   "content-length",
+  "server",
+  "x-powered-by",
+  "via",
+  "x-aspnet-version",
   "set-cookie",
   "access-control-allow-origin",
   "access-control-allow-credentials",

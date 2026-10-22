@@ -5,12 +5,19 @@ const API_BASE = import.meta.env.VITE_API_URL ?? "";
 export const HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"] as const;
 export type HttpMethod = (typeof HTTP_METHODS)[number];
 
+export interface ApiPriceRule {
+  method: HttpMethod;
+  pathPattern: string;
+  price: string;
+}
+
 /** A pay-per-call API as anyone sees it in the catalog. */
 export interface PublicApi {
   id: string;
   name: string;
   description: string | null;
   price: string;
+  priceRules: ApiPriceRule[];
   currency: "USDC";
   walletAddress: string;
   allowedMethods: HttpMethod[];
@@ -80,6 +87,7 @@ export interface ApiInput {
   description?: string | null;
   upstreamUrl?: string;
   price?: string;
+  priceRules?: ApiPriceRule[] | null;
   walletAddress?: string;
   allowedMethods?: HttpMethod[];
   upstreamHeader?: { name: string; value: string } | null;

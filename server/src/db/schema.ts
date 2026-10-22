@@ -1,4 +1,5 @@
 import {
+  check,
   pgTable,
   text,
   real,
@@ -10,6 +11,7 @@ import {
   index,
   uniqueIndex,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { createId } from "@paralleldrive/cuid2";
 
 export const resourceTypeEnum = pgEnum("resource_type", ["file", "link"]);
@@ -27,6 +29,12 @@ export const onchainStatusEnum = pgEnum("onchain_status_enum", [
   "registered",
   "failed",
 ]);
+
+export interface ApiPriceRule {
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+  pathPattern: string;
+  price: string;
+}
 
 // Publishers — humans or AI agents that publish resources
 export const publishers = pgTable("publishers", {
@@ -138,8 +146,11 @@ export const apis = pgTable(
     // Never exposed publicly: callers must go through the paid proxy.
     upstreamUrl: text("upstream_url").notNull(),
     price: text("price").notNull(), // USDC per call
+    priceRules: jsonb("price_rules").$type<ApiPriceRule[]>().notNull().default([]),
     walletAddress: text("wallet_address").notNull(),
     allowedMethods: jsonb("allowed_methods").$type<string[]>().notNull().default(["GET"]),
+    payerAllowlist: jsonb("payer_allowlist").$type<string[] | null>(),
+    payerDenylist: jsonb("payer_denylist").$type<string[]>().notNull().default([]),
     // Header the proxy adds to every upstream request, e.g. the provider's own
     // API key. The value is AES-256-GCM encrypted (see utils/secretBox.ts).
     upstreamHeaderName: text("upstream_header_name"),
@@ -168,6 +179,10 @@ export const apis = pgTable(
     ownershipVerifiedAt: timestamp("ownership_verified_at"),
     listed: boolean("listed").notNull().default(false),
     tags: jsonb("tags").$type<string[]>().notNull().default([]),
+    // Issue #30: price callers pay for a time-limited access pass (null = passes not offered).
+    passPrice: text("pass_price"),
+    // Issue #32: free calls a new wallet may make per day before the paywall kicks in (0 = disabled).
+    freeCallsPerDay: integer("free_calls_per_day").notNull().default(0),
     // Soft delete: archived APIs are hidden everywhere but keep their call history.
     archivedAt: timestamp("archived_at"),
     createdAt: timestamp("created_at").defaultNow().notNull(),
@@ -176,6 +191,65 @@ export const apis = pgTable(
     publisherIdx: index("idx_apis_publisher_id").on(table.publisherId),
     catalogIdx: index("idx_apis_listed_created_at").on(table.listed, table.createdAt),
     tagsIdx: index("idx_apis_tags").using("gin", table.tags),
+  }),
+);
+
+export const apiCreditBalances = pgTable(
+  "api_credit_balances",
+  {
+    id: text("id")
+      .primaryKey()
+      .$defaultFn(() => createId()),
+    apiId: text("api_id")
+      .notNull()
+      .references(() => apis.id),
+    walletAddress: text("wallet_address").notNull(),
+    balance: integer("balance").notNull().default(0),
+    updatedAt: timestamp("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    apiWalletIdx: uniqueIndex("idx_api_credit_balances_api_wallet").on(
+      table.apiId,
+      table.walletAddress,
+    ),
+    nonNegativeBalance: check("api_credit_balances_balance_check", sql`${table.balance} >= 0`),
+  }),
+);
+
+export const apiCreditLedger = pgTable(
+  "api_credit_ledger",
+  {
+    id: text("id")
+      .primaryKey()
+      .$defaultFn(() => createId()),
+    apiId: text("api_id")
+      .notNull()
+      .references(() => apis.id),
+    walletAddress: text("wallet_address").notNull(),
+    delta: integer("delta").notNull(),
+    entryType: text("entry_type").$type<"purchase" | "spend">().notNull(),
+    reference: text("reference"),
+    requestNonce: text("request_nonce"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    purchaseReferenceIdx: uniqueIndex("idx_api_credit_ledger_purchase_reference")
+      .on(table.reference)
+      .where(sql`${table.entryType} = 'purchase'`),
+    spendNonceIdx: uniqueIndex("idx_api_credit_ledger_spend_nonce").on(
+      table.apiId,
+      table.walletAddress,
+      table.requestNonce,
+    ).where(sql`${table.entryType} = 'spend'`),
+    apiWalletCreatedIdx: index("idx_api_credit_ledger_api_wallet_created").on(
+      table.apiId,
+      table.walletAddress,
+      table.createdAt,
+    ),
+    validEntryType: check(
+      "api_credit_ledger_entry_type_check",
+      sql`${table.entryType} in ('purchase', 'spend')`,
+    ),
   }),
 );
 
@@ -209,3 +283,35 @@ export const apiCalls = pgTable(
     ),
   }),
 );
+
+// API passes (#30) — time-limited access tokens purchased via x402.
+// A caller with an active pass is not charged per call until the pass expires.
+export const apiPasses = pgTable(
+  "api_passes",
+  {
+    id: text("id")
+      .primaryKey()
+      .$defaultFn(() => createId()),
+    apiId: text("api_id")
+      .notNull()
+      .references(() => apis.id),
+    payerAddress: text("payer_address").notNull(),
+    // USDC amount paid for the pass.
+    amount: text("amount").notNull(),
+    // Settlement transaction hash from x402 (null until settled).
+    txHash: text("tx_hash"),
+    activeFrom: timestamp("active_from").defaultNow().notNull(),
+    expiresAt: timestamp("expires_at").notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    // The primary lookup: "does this payer have an active pass for this API?"
+    apiPayerExpiresIdx: index("idx_api_passes_api_payer_expires").on(
+      table.apiId,
+      table.payerAddress,
+      table.expiresAt,
+    ),
+  }),
+);
+
+export type ApiPassRow = typeof apiPasses.$inferSelect;

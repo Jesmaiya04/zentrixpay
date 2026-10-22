@@ -16,20 +16,30 @@ const api: PublicApi = {
   name: "Weather API",
   description: "Forecasts",
   price: "0.01",
+  priceRules: [],
   currency: "USDC",
   walletAddress: "GPROVIDER",
   allowedMethods: ["GET", "POST"],
   tags: [],
+  healthy: true,
   proxyUrl: "http://gw.test/api/api1",
+  openapiUrl: null,
+  onchain: { registered: false, contractId: "", txHash: null },
   createdAt: "2026-10-01T00:00:00Z",
 };
 
 const disconnectedWallet: WalletState = {
   status: "disconnected",
   address: null,
+  error: null,
   connect: vi.fn(),
   disconnect: vi.fn(),
-  network: null,
+};
+
+const connectedWallet: WalletState = {
+  ...disconnectedWallet,
+  status: "connected",
+  address: "G".padEnd(56, "A"),
 };
 
 function renderModal(onClose = vi.fn()) {
@@ -124,5 +134,27 @@ describe("TryItModal – accessibility", () => {
 
     await userEvent.tab({ shift: true });
     expect(document.activeElement).toBe(last);
+  });
+
+  it("sends headers entered in the request headers editor", async () => {
+    vi.mocked(callPaidApi).mockResolvedValue({
+      status: 200,
+      charged: true,
+      price: "0.01",
+      contentType: "application/json",
+      body: { ok: true },
+    });
+    render(<TryItModal api={api} wallet={connectedWallet} onClose={vi.fn()} />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Add header" }));
+    await userEvent.type(screen.getByLabelText("Header name 1"), "x-tenant-key");
+    await userEvent.type(screen.getByLabelText("Header value 1"), "tenant-123");
+    await userEvent.click(screen.getByRole("button", { name: "Send request" }));
+
+    expect(callPaidApi).toHaveBeenCalledWith(
+      api.proxyUrl,
+      connectedWallet.address,
+      expect.objectContaining({ headers: { "x-tenant-key": "tenant-123" } }),
+    );
   });
 });

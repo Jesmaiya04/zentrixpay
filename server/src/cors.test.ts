@@ -1,5 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { parseAllowedOrigins, X402_ALLOWED_HEADERS, X402_EXPOSED_HEADERS } from "./cors.js";
+import express from "express";
+import request from "supertest";
+import {
+  corsMiddleware,
+  parseAllowedOrigins,
+  X402_ALLOWED_HEADERS,
+  X402_EXPOSED_HEADERS,
+} from "./cors.js";
 
 vi.mock("./config.js", () => ({
   config: {
@@ -31,11 +38,31 @@ describe("createCorsOptions", () => {
     vi.resetModules();
   });
 
-  it("uses explicit x402 headers in production", async () => {
-    const { createCorsOptions } = await import("./cors.js");
-    const options = createCorsOptions();
-    expect(options.allowedHeaders).toEqual([...X402_ALLOWED_HEADERS]);
-    expect(options.exposedHeaders).toEqual([...X402_EXPOSED_HEADERS]);
+  it("keeps the production allowlist on non-proxy routes", async () => {
+    const app = express();
+    app.use(corsMiddleware());
+    const response = await request(app)
+      .options("/apis")
+      .set("Origin", "https://app.example.com")
+      .set("Access-Control-Request-Method", "GET");
+    const allowed = response.headers["access-control-allow-headers"].toLowerCase();
+    for (const header of X402_ALLOWED_HEADERS) {
+      expect(allowed).toContain(header.toLowerCase());
+    }
+    expect(response.headers["access-control-expose-headers"]).toContain(
+      X402_EXPOSED_HEADERS[0],
+    );
+  });
+
+  it("reflects requested headers only for API proxy paths", async () => {
+    const app = express();
+    app.use(corsMiddleware());
+    const response = await request(app)
+      .options("/api/weather/v1/forecast")
+      .set("Origin", "https://app.example.com")
+      .set("Access-Control-Request-Method", "POST")
+      .set("Access-Control-Request-Headers", "content-type, x-tenant-key");
+    expect(response.headers["access-control-allow-headers"]).toBe("content-type,x-tenant-key");
   });
 
   it("rejects unlisted origins in production", async () => {

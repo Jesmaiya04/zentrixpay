@@ -31,12 +31,15 @@ const weather: PublicApi = {
   name: "Weather API",
   description: "Forecasts for any city",
   price: "0.01",
+  priceRules: [],
   currency: "USDC",
   walletAddress: "GPROVIDER",
   allowedMethods: ["GET", "POST"],
   tags: ["weather"],
   healthy: true,
   proxyUrl: "http://gw.test/api/api1",
+  openapiUrl: null,
+  onchain: { registered: false, contractId: "", txHash: null },
   createdAt: "2026-10-01T00:00:00Z",
 };
 

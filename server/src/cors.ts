@@ -56,7 +56,21 @@ export function createCorsOptions(): CorsOptions {
       : true,
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: isProduction ? [...X402_ALLOWED_HEADERS] : "*",
+    allowedHeaders: isProduction
+      ? (req, callback) => {
+          if (/^\/api\/[^/]+(?:\/|$)/.test(req.path)) {
+            const requested = req.headers["access-control-request-headers"];
+            callback(
+              null,
+              typeof requested === "string"
+                ? requested.split(",").map((header) => header.trim()).filter(Boolean)
+                : [],
+            );
+            return;
+          }
+          callback(null, [...X402_ALLOWED_HEADERS]);
+        }
+      : "*",
     exposedHeaders: isProduction ? [...X402_EXPOSED_HEADERS] : "*",
   };
 }

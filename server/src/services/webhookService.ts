@@ -1,5 +1,5 @@
 import { createHmac } from "node:crypto";
-import { config } from "../config.js";
+import { config, upstreamKeyRing } from "../config.js";
 import { getLogger } from "../lib/logger.js";
 import { sendUpstream } from "../lib/upstreamClient.js";
 import { decryptSecret } from "../utils/secretBox.js";
@@ -72,16 +72,16 @@ async function attemptDelivery(url: string, secret: string, eventId: string, bod
 export function deliverChargedCallWebhook(api: ApiRow, call: ChargedCallEvent): void {
   if (!api.webhookUrl || !api.webhookSecretEnc) return;
   const log = getLogger();
-  if (!config.UPSTREAM_SECRET_KEY) {
+  if (upstreamKeyRing.length === 0) {
     log.warn(
       { event: "webhook_skipped", apiId: api.id, reason: "no_secret_key" },
-      "webhook configured but UPSTREAM_SECRET_KEY is missing",
+      "webhook configured but UPSTREAM_SECRET_KEY / UPSTREAM_SECRET_KEYS is missing",
     );
     return;
   }
 
   const url = api.webhookUrl;
-  const secret = decryptSecret(api.webhookSecretEnc, config.UPSTREAM_SECRET_KEY);
+  const secret = decryptSecret(api.webhookSecretEnc, upstreamKeyRing, config.UPSTREAM_SECRET_KEY);
   const eventId = `evt_${call.callId}`;
   const body = JSON.stringify({
     id: eventId,
