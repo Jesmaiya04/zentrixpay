@@ -85,6 +85,7 @@ export function toOwnerApi(api: ApiRow) {
     payerAllowlist: api.payerAllowlist,
     payerDenylist: api.payerDenylist,
     listed: api.listed,
+    streamingEnabled: api.streamingEnabled,
     onchainStatus: api.onchainStatus,
     ownershipVerified: Boolean(api.ownershipVerifiedAt),
     ownershipVerification: {
@@ -223,6 +224,7 @@ export async function createApi(input: CreateApiInput): Promise<ApiRow> {
       freeCallsPerDay: input.freeCallsPerDay ?? 0,
       ownershipToken: randomBytes(16).toString("hex"),
       openapiSpec: checkedOpenApiSpec(input.openapiSpec),
+      streamingEnabled: input.streamingEnabled ?? false,
       ...encryptedHeader(input.upstreamHeader),
       ...encryptedQueryParam(input.upstreamQueryParam),
     })

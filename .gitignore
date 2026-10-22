@@ -11,6 +11,9 @@ target/
 # Bundle analysis report (generated locally by `pnpm --filter @zentrixpay/web bundle:stats`)
 web/stats.html
 
+# pnpm content-addressable store (local cache, never committed)
+.pnpm-store/
+
 # Secrets — never commit real env files (only .env.example is tracked)
 .env
 .env.local

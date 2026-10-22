@@ -51,7 +51,7 @@ import {
   prepareApiRegistration,
 } from "../services/apiOnchain.js";
 import { confirmCallRefund, prepareCallRefund } from "../services/apiRefunds.js";
-import { sendUpstream, UpstreamError } from "../lib/upstreamClient.js";
+import { sendUpstream, streamUpstream, UpstreamError } from "../lib/upstreamClient.js";
 import { filterRequestHeaders, filterResponseHeaders } from "../lib/proxyHeaders.js";
 import { paymentHeader, paymentHeaderHash, payerFromPayment } from "../lib/payer.js";
 import {
@@ -495,16 +495,12 @@ function proxyIdempotency(req: Request, res: Response, next: NextFunction) {
 
 const UPSTREAM_ERROR_STATUS = { blocked: 502, network: 502, too_large: 502, timeout: 504 } as const;
 
-async function proxyHandler(req: Request, res: Response) {
-  const api = res.locals.api as ApiRow;
-  const segments = (req.params.path as unknown as string[] | undefined) ?? [];
-  const target = buildUpstreamUrl(api.upstreamUrl, segments, req.originalUrl);
-  if (!target) {
-    res.status(400).json({ error: "Invalid path" });
-    return;
-  }
-
-  const headers = filterRequestHeaders(req.headers);
+/** Build and inject upstream secrets into headers/url, returning the secrets manifest. */
+function prepareUpstreamRequest(
+  api: ApiRow,
+  target: URL,
+  reqHeaders: ReturnType<typeof filterRequestHeaders>,
+): UpstreamSecrets {
   const secrets: UpstreamSecrets = { values: [] };
   if (api.upstreamHeaderName && api.upstreamHeaderValueEnc && upstreamKeyRing.length > 0) {
     const value = decryptSecret(api.upstreamHeaderValueEnc, upstreamKeyRing, config.UPSTREAM_SECRET_KEY);
@@ -517,9 +513,24 @@ async function proxyHandler(req: Request, res: Response) {
     secrets.queryName = api.upstreamQueryName;
     secrets.values.push(value);
   }
+  return secrets;
+}
+
+async function proxyHandler(req: Request, res: Response) {
+  const api = res.locals.api as ApiRow;
+  const segments = (req.params.path as unknown as string[] | undefined) ?? [];
+  const target = buildUpstreamUrl(api.upstreamUrl, segments, req.originalUrl);
+  if (!target) {
+    res.status(400).json({ error: "Invalid path" });
+    return;
+  }
+
+  const headers = filterRequestHeaders(req.headers);
+  const secrets = prepareUpstreamRequest(api, target, headers);
   const body = Buffer.isBuffer(req.body) && req.body.length > 0 ? req.body : undefined;
 
   const started = Date.now();
+
   // Recorded once the response (and settlement) is complete: a final status
   // below 400 means the x402 middleware settled the payment.
   res.on("finish", () => {
@@ -536,19 +547,6 @@ async function proxyHandler(req: Request, res: Response) {
         target.pathname.slice(new URL(api.upstreamUrl).pathname.replace(/\/+$/, "").length) || "/",
       responseStatus: res.statusCode,
       durationMs: Date.now() - started,
-    };
-    const charged = res.statusCode < 400;
-    if (charged) deliverChargedCallWebhook(api, { ...call, amount: api.price });
-    recordApiCall({
-      id: call.callId,
-      apiId: api.id,
-      payerAddress: call.payerAddress,
-      amount: api.price,
-      charged,
-      method: call.method,
-      path: call.path,
-      responseStatus: call.responseStatus,
-      durationMs: call.durationMs,
     }).catch((err) =>
       getLogger().error(
         { event: "api_call_record_failed", apiId: api.id, err },
@@ -557,17 +555,77 @@ async function proxyHandler(req: Request, res: Response) {
     );
   });
 
+  const upstreamOpts = {
+    url: target,
+    method: req.method,
+    headers,
+    body,
+    timeoutMs: api.timeoutMs ?? config.PROXY_DEFAULT_TIMEOUT_MS,
+    maxResponseBytes: effectiveMaxResponseBytes(api),
+    allowPrivate: config.PROXY_ALLOW_PRIVATE_UPSTREAMS,
+  };
+
+  // ── Streaming path (SSE / chunked) ─────────────────────────────────────────
+  // settle-before-stream: the x402 middleware already collected payment before
+  // this handler runs. If the upstream fails before the first byte we never
+  // write a 2xx status to the caller, so the caller is not charged
+  // (see the "finish" listener above — charged = statusCode < 400).
+  if (api.streamingEnabled) {
+    let upstream;
+    try {
+      upstream = await streamUpstream(upstreamOpts);
+    } catch (err) {
+      if (err instanceof UpstreamError) {
+        getLogger().warn(
+          { event: "api_upstream_stream_failed", apiId: api.id, kind: err.kind, error: err.message },
+          "upstream stream failed before first byte; caller not charged",
+        );
+        res
+          .status(UPSTREAM_ERROR_STATUS[err.kind])
+          .json({ error: "upstream_failed", reason: err.kind });
+        return;
+      }
+      throw err;
+    }
+
+    // Mirror useful response headers (no buffering, no content-length).
+    const responseHeaders = filterResponseHeaders(upstream.headers);
+    res.status(upstream.status);
+    for (const [name, value] of Object.entries(responseHeaders)) {
+      const rewritten =
+        typeof value === "string"
+          ? rewriteResponseHeader(name, value, api, secrets)
+          : value;
+      res.setHeader(name, rewritten);
+    }
+
+    // For SSE: disable compression / buffering on the Express response so
+    // events reach the caller immediately.
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders();
+
+    upstream.stream.pipe(res);
+
+    upstream.stream.on("error", (err) => {
+      getLogger().warn(
+        { event: "api_upstream_stream_error", apiId: api.id, error: err.message },
+        "upstream stream error mid-flight",
+      );
+      if (!res.writableEnded) res.end();
+    });
+
+    req.on("close", () => {
+      // Client disconnected early — destroy the upstream socket too.
+      upstream.stream.destroy();
+    });
+
+    return;
+  }
+
+  // ── Buffered path (default) ─────────────────────────────────────────────────
   let upstream;
   try {
-    upstream = await sendUpstream({
-      url: target,
-      method: req.method,
-      headers,
-      body,
-      timeoutMs: api.timeoutMs ?? config.PROXY_DEFAULT_TIMEOUT_MS,
-      maxResponseBytes: effectiveMaxResponseBytes(api),
-      allowPrivate: config.PROXY_ALLOW_PRIVATE_UPSTREAMS,
-    });
+    upstream = await sendUpstream(upstreamOpts);
   } catch (err) {
     if (err instanceof UpstreamError) {
       getLogger().warn(
@@ -585,7 +643,9 @@ async function proxyHandler(req: Request, res: Response) {
   const responseHeaders: StoredProxyResponse["headers"] = {};
   for (const [name, value] of Object.entries(filterResponseHeaders(upstream.headers))) {
     responseHeaders[name] =
-      name === "location" && typeof value === "string" ? rewriteLocation(value, api) : value;
+      typeof value === "string"
+        ? rewriteResponseHeader(name, value, api, secrets)
+        : value;
   }
   // Kept for Idempotency-Key replay once the call is known to be charged.
   res.locals.proxyResponse = {

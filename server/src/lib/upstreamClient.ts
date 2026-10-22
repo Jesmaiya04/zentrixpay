@@ -1,5 +1,6 @@
 import http from "node:http";
 import https from "node:https";
+import { Readable } from "node:stream";
 import { lookup as dnsLookup, type LookupAddress } from "node:dns";
 import { isIP, type LookupFunction } from "node:net";
 import { isPublicAddress } from "./upstreamGuard.js";
@@ -29,6 +30,18 @@ export interface UpstreamResponse {
   status: number;
   headers: http.IncomingHttpHeaders;
   body: Buffer;
+}
+
+/**
+ * The result of a streaming upstream connection. `stream` is the raw
+ * IncomingMessage; the caller is responsible for piping / destroying it.
+ * Resolves as soon as the upstream status and headers are available — before
+ * any body bytes arrive — so the proxy can start forwarding immediately.
+ */
+export interface UpstreamStreamResponse {
+  status: number;
+  headers: http.IncomingHttpHeaders;
+  stream: Readable;
 }
 
 /**
@@ -115,6 +128,74 @@ export function sendUpstream(req: UpstreamRequest): Promise<UpstreamResponse> {
           });
         });
         incoming.on("error", (err) => fail(new UpstreamError("network", err.message)));
+      },
+    );
+
+    const timer = setTimeout(
+      () =>
+        fail(new UpstreamError("timeout", `upstream did not respond within ${req.timeoutMs}ms`)),
+      req.timeoutMs,
+    );
+
+    outgoing.on("error", (err) => {
+      fail(err instanceof UpstreamError ? err : new UpstreamError("network", err.message));
+    });
+
+    if (req.body) outgoing.write(req.body);
+    outgoing.end();
+  });
+}
+
+/**
+ * Open a streaming connection to the upstream and resolve with the status,
+ * headers, and the raw response stream as soon as the first response byte is
+ * available. The caller must consume or destroy the returned stream.
+ *
+ * Unlike `sendUpstream`, this function does NOT buffer the body — it is the
+ * caller's responsibility to pipe it and enforce any size/time limits.
+ *
+ * The promise rejects (with `UpstreamError`) if the connection fails or the
+ * upstream does not send a response within `timeoutMs`.
+ */
+export function streamUpstream(req: UpstreamRequest): Promise<UpstreamStreamResponse> {
+  const host = req.url.hostname.replace(/^\[|\]$/g, "");
+  if (!req.allowPrivate && isIP(host) && !isPublicAddress(host)) {
+    return Promise.reject(new UpstreamError("blocked", "upstream address is not public"));
+  }
+
+  const transport = req.url.protocol === "https:" ? https : http;
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const fail = (err: UpstreamError) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      outgoing.destroy();
+      reject(err);
+    };
+
+    const outgoing = transport.request(
+      req.url,
+      {
+        method: req.method,
+        headers: req.body
+          ? { ...req.headers, "content-length": String(req.body.length) }
+          : req.headers,
+        lookup: guardedLookup(req.allowPrivate),
+      },
+      (incoming) => {
+        if (settled) {
+          incoming.destroy();
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        resolve({
+          status: incoming.statusCode ?? 502,
+          headers: incoming.headers,
+          stream: incoming,
+        });
       },
     );
 
