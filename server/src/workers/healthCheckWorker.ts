@@ -1,4 +1,4 @@
-import { config } from "../config.js";
+import { config, upstreamKeyRing } from "../config.js";
 import { getLogger } from "../lib/logger.js";
 import { sendUpstream } from "../lib/upstreamClient.js";
 import { decryptSecret } from "../utils/secretBox.js";
@@ -42,9 +42,10 @@ export function stopHealthCheckWorker(): void {
 export async function checkApiHealth(api: ApiRow): Promise<boolean> {
   const headers: Record<string, string> = { "user-agent": "ZentrixPay-HealthCheck/1" };
   // Upstreams locked down to the secret header need it on health checks too.
-  if (api.upstreamHeaderName && api.upstreamHeaderValueEnc && config.UPSTREAM_SECRET_KEY) {
+  if (api.upstreamHeaderName && api.upstreamHeaderValueEnc && upstreamKeyRing.length > 0) {
     headers[api.upstreamHeaderName] = decryptSecret(
       api.upstreamHeaderValueEnc,
+      upstreamKeyRing,
       config.UPSTREAM_SECRET_KEY,
     );
   }
