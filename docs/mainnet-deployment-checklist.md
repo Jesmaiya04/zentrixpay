@@ -1,208 +1,81 @@
-# Mainnet Deployment Checklist
+# Mainnet Readiness Checklist for the ZentrixPay Proxy
 
-Use this checklist when moving a ZentrixPay deployment from Stellar testnet to mainnet.
-
-Legend:
-- 🔒 Involves a secret or private key — handle with care
-- ⚠️ Irreversible or high-impact action
-- 🧪 Testnet-only — skip or remove on mainnet
+> Work through every item before pointing `STELLAR_NETWORK=mainnet` at real funds.
+> The server enforces some of these checks at startup (marked **enforced**); the
+> rest are operational reminders that cannot be machine-verified.
 
 ---
 
-## 1. Prerequisites
+## 1. Network configuration
 
-- [ ] Node.js 20+ installed on the deployment target
-- [ ] `pnpm` installed globally
-- [ ] `stellar` CLI installed (`cargo install stellar-cli` or via package manager)
-- [ ] Supabase project created and accessible
-- [ ] OpenRouter account with billing enabled and API key ready 🔒
-- [ ] Circle or another USDC issuer account for mainnet USDC
+- [ ] `STELLAR_NETWORK` is set to `mainnet`.
+- [ ] `NETWORK` matches the x402 mainnet network identifier (e.g. `base`).
+- [ ] `SOROBAN_RPC_URL` points at a mainnet Soroban RPC node (not `testnet`).
+- [ ] `FACILITATOR_URL` points at a mainnet x402 facilitator (not the testnet default).
+- [ ] `USDC_CONTRACT_ID` is the **mainnet** USDC-on-Stellar SAC contract ID.
+- [ ] `VAULT_REGISTRY_CONTRACT_ID` is the mainnet vault-registry contract ID.
+- [ ] `REGISTRY_CONTRACT_ID` is the mainnet registry contract ID.
 
----
+## 2. Key management
 
-## 2. Stellar Wallets
+- [ ] `AGENT_SECRET_KEY` is a **mainnet** Stellar secret key (starts with `S`), not the testnet key.
+- [ ] `REGISTRY_SECRET_KEY` is a funded mainnet deployer/owner secret key.
+- [ ] **`UPSTREAM_SECRET_KEYS`** (or `UPSTREAM_SECRET_KEY`) is set; upstream API secrets
+      **cannot** be stored without it.
+- [ ] All secret keys are injected via a secrets manager (Vault, AWS Secrets Manager, etc.) —
+      never hard-coded in environment files committed to the repository.
+- [ ] Key rotation plan is in place: old key ids remain in `UPSTREAM_SECRET_KEYS` until
+      all stored ciphertexts are re-encrypted with the new active key
+      (`pnpm tsx server/scripts/reencrypt-secrets.ts`).
 
-### 2a. Create mainnet wallets
+## 3. USDC contract and payment settings
 
-The platform requires two wallets: a **platform wallet** (receives fees) and an **agent wallet** (pays for verification).
+- [ ] `PAY_TO` is the production platform wallet address, verified on-chain.
+- [ ] `VERIFICATION_PRICE` is reviewed and set to the correct USD amount for mainnet traffic.
+- [ ] Per-API `price` values are confirmed in USDC (not test amounts).
 
-```bash
-# Generate platform wallet
-cd server && pnpm generate-wallet
+## 4. SSRF and upstream safety **(enforced)**
 
-# Generate agent wallet (run again — use a different output)
-pnpm generate-wallet
-```
+- [ ] `PROXY_ALLOW_PRIVATE_UPSTREAMS` is **not** set to `true` in any mainnet deployment.
+      The server will **refuse to start** if this is misconfigured on mainnet.
+- [ ] Outbound IP allowlisting is in place at the network layer as a defence-in-depth measure.
 
-Record both `publicKey` and `secretKey` values. Store secret keys in a secrets manager (e.g. AWS Secrets Manager, 1Password). 🔒
+## 5. Rate limits and resource caps
 
-### 2b. Fund wallets with mainnet XLM
+- [ ] `RATE_LIMIT_VERIFY_IP_MAX` and wallet-based limits are sized for expected mainnet traffic.
+- [ ] `PROXY_MAX_RESPONSE_BYTES` and per-API `maxResponseBytes` are reviewed.
+- [ ] `PROXY_MAX_REQUEST_BODY` is appropriate (default 5 MB).
 
-Each Stellar account requires a minimum balance (~1 XLM base reserve). Fund both wallets via an exchange or Stellar anchor.
+## 6. Database and infrastructure
 
-```bash
-# Verify balance after funding
-stellar account show --network mainnet --account <PUBLIC_KEY>
-```
+- [ ] `DATABASE_URL` points at a production Postgres instance with daily backups.
+- [ ] `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` are production credentials.
+- [ ] Supabase storage bucket (`SUPABASE_STORAGE_BUCKET`) is a production bucket with
+      access policies set.
+- [ ] Drizzle migrations have been run against the production database
+      (`pnpm --filter @zentrixpay/server db:migrate`).
 
-### 2c. Establish USDC trustlines
+## 7. Observability
 
-On mainnet, USDC is issued by Circle. The asset code is `USDC`, issuer is `GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN`.
+- [ ] `SENTRY_DSN` is set so unhandled errors are captured.
+- [ ] `METRICS_TOKEN` is set and the `/metrics` endpoint is not publicly reachable.
+- [ ] Structured logs are shipped to a log aggregation service.
+- [ ] Alerting is configured for: payment failures, upstream errors (5xx rate), DB pool exhaustion.
 
-```bash
-stellar tx new change-trust \
-  --asset USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN \
-  --source <AGENT_SECRET_KEY> \
-  --network mainnet \
-  --build-only | stellar tx sign --sign-with-key <AGENT_SECRET_KEY> | stellar tx send --network mainnet
-```
+## 8. TLS and secrets scanning
 
-Repeat for the platform wallet if it also needs a trustline.
+- [ ] The server is behind a TLS-terminating reverse proxy or load balancer.
+- [ ] `BASE_URL` uses `https://`.
+- [ ] `WEB_APP_URL` uses `https://`.
+- [ ] Secret scanning (gitleaks) passes on the final commit: `make secrets-scan`.
 
-### 2d. Fund agent wallet with USDC
+## 9. Final smoke test
 
-The agent wallet pays $0.10 USDC per content verification. Deposit sufficient USDC (e.g. $5–$10 to start). ⚠️
-
----
-
-## 3. Soroban Contract
-
-### 3a. Build the contract
-
-```bash
-cd contract
-cargo test                                        # confirm tests pass
-stellar contract build --manifest-path Cargo.toml
-```
-
-### 3b. Deploy to mainnet ⚠️
-
-```bash
-# Create and fund a deployer identity if you don't have one
-stellar keys generate deployer --network mainnet
-# Fund it with XLM from an exchange
-
-stellar contract deploy \
-  --wasm target/wasm32v1-none/release/vault_registry.wasm \
-  --source deployer \
-  --network mainnet
-```
-
-Record the printed contract ID. This is your mainnet `VAULT_REGISTRY_CONTRACT_ID`. ⚠️ Deployments are permanent and cannot be undone.
-
-### 3c. Regenerate TypeScript bindings
-
-```bash
-cd /path/to/zentrixpay
-VAULT_REGISTRY_CONTRACT_ID=<MAINNET_CONTRACT_ID> STELLAR_NETWORK=mainnet pnpm contract:bindings
-```
-
-Commit the updated `packages/registry-client/src/generated/index.ts`.
+- [ ] `pnpm --filter @zentrixpay/server test:e2e:mainnet` passes (or the equivalent
+      mainnet smoke script).
+- [ ] A manual curl confirms a live paid call through the proxy settles correctly.
+- [ ] `GET /.well-known/x402` returns the expected discovery index.
 
 ---
 
-## 4. Supabase
-
-- [ ] Create storage bucket named `resources` (or the value of `SUPABASE_STORAGE_BUCKET`) with appropriate access policies
-- [ ] Run migrations against the production database:
-
-```bash
-cd server
-DATABASE_URL=<PROD_DATABASE_URL> pnpm db:migrate
-```
-
-- [ ] Confirm all tables exist: `publishers`, `resources`, `payments`, `verifications`
-
----
-
-## 5. Environment Variables
-
-Update `server/.env` (or your secrets manager / deployment environment) with mainnet values. Testnet-only values are marked 🧪.
-
-| Variable | Testnet value 🧪 | Mainnet value |
-|----------|-----------------|---------------|
-| `NETWORK` | `stellar:testnet` | `stellar:mainnet` |
-| `SOROBAN_RPC_URL` | `https://soroban-testnet.stellar.org` | `https://soroban-mainnet.stellar.org` |
-| `FACILITATOR_URL` | `https://www.x402.org/facilitator` | Confirm with x402.org — mainnet facilitator URL may differ |
-| `VAULT_REGISTRY_CONTRACT_ID` | `CDQKUIADLO5S5WEHEUTTXX2M45WAHVRU2PBEBD6ZGDKMOP5A72FJ3OD4` 🧪 | Your deployed mainnet contract ID |
-| `REGISTRY_CONTRACT_ID` | same as above 🧪 | Same as `VAULT_REGISTRY_CONTRACT_ID` |
-| `PAY_TO` | testnet platform wallet 🧪 | mainnet platform wallet address |
-| `AGENT_SECRET_KEY` | testnet agent secret 🔒🧪 | mainnet agent secret 🔒 |
-| `REGISTRY_SECRET_KEY` | testnet deployer secret 🔒🧪 | mainnet deployer secret 🔒 |
-| `BASE_URL` | `http://localhost:4021` | `https://your-production-domain.com` |
-| `DATABASE_URL` | local / testnet Supabase 🧪 | production Supabase connection string 🔒 |
-| `SUPABASE_URL` | testnet project 🧪 | production project URL |
-| `SUPABASE_SERVICE_KEY` | testnet service key 🔒🧪 | production service key 🔒 |
-| `OPENROUTER_API_KEY` | any valid key 🔒 | production key with billing 🔒 |
-
-See [`docs/environment-variables.md`](./environment-variables.md) for full variable descriptions.
-
----
-
-## 6. x402 Facilitator
-
-- [ ] Confirm that the x402 facilitator at `FACILITATOR_URL` supports mainnet Stellar payments
-- [ ] The testnet facilitator (`x402.org/facilitator`) sponsors fees. On mainnet, transaction fees are paid by the submitting account — ensure the agent wallet holds enough XLM for fees (0.00001 XLM per operation; a safety buffer of 1 XLM is sufficient for thousands of transactions)
-- [ ] Test a manual payment end-to-end with a small amount before going live ⚠️
-
----
-
-## 7. Final Smoke Tests
-
-Run these against the deployed mainnet server before announcing availability.
-
-```bash
-BASE=https://your-production-domain.com
-
-# Health check
-curl -s $BASE/health | jq .
-
-# 402 on a real resource
-curl -i $BASE/resources/<RESOURCE_ID>
-# Expected: HTTP/1.1 402 Payment Required
-# Expected header: PAYMENT-REQUIRED: eyJ...
-
-# Browse catalog
-curl -s $BASE/resources | jq '.[].title'
-
-# Agent status
-curl -s $BASE/agent/status | jq .agent
-```
-
-- [ ] Health check returns `{"status":"ok"}`
-- [ ] Paywalled resource returns `402` with `PAYMENT-REQUIRED` header
-- [ ] `BASE_URL` in responses matches production domain (not `localhost`)
-- [ ] Agent wallet address in `/agent/status` matches mainnet `PAY_TO`
-
----
-
-## 8. Post-Deployment
-
-- [ ] Rotate testnet secrets — do not reuse them in production 🔒
-- [ ] Set up monitoring / alerting for server errors and failed payment settlements
-- [ ] Verify on [Stellar Expert (mainnet)](https://stellar.expert/explorer/public) that the contract is visible and the platform wallet address is correct
-- [ ] Update README links to point to the production deployment
-
----
-
-## MCP mainnet guardrails
-
-When the MCP server runs with `STELLAR_NETWORK=mainnet` (or x402 `stellar:pubnet`), tools that **mutate state or spend funds** require an explicit confirmation. Read-only tools stay unrestricted.
-
-**Gated tools:** `zentrixpay_setup_wallet`, `zentrixpay_register`, `zentrixpay_publish`, `zentrixpay_buy`, `zentrixpay_register_onchain`, `zentrixpay_reset`, `zentrixpay_update_metadata`, `zentrixpay_set_price`, `zentrixpay_transfer_ownership`, `zentrixpay_set_listed`.
-
-**Confirm either:**
-
-1. Pass `confirmMainnet: true` on the tool call, or
-2. Set `ZENTRIXPAY_ALLOW_MAINNET=1` on the MCP process (unlocks all gated tools for that process).
-
-**Safer defaults for `ZENTRIXPAY_ALLOW_MAINNET` (#606):** the env override is parsed fail-safe. Only `1` / `true` / `yes` widen the policy to process-wide `allow-all`; everything else — unset, empty, `0` / `false` / `no` / `off`, and any unrecognized value — keeps per-call confirmation. A set value that unlocks nothing (an unexpanded `$ZENTRIXPAY_ALLOW_MAINNET` template placeholder, `on`, `enabled`, a typo) is reported as a startup **warning** so the deployment mistake surfaces immediately; explicit denials stay quiet because they state intent. A typo in a safety setting fails towards *more* confirmation, never less.
-
-Without confirmation the tool returns a deterministic, agent-safe error (no secrets). Diagnostics also appear in `zentrixpay_registry_info` (`network`, `x402Network`, `mainnetDiagnostics`).
-
-```json
-{ "resourceId": "res-001", "confirmMainnet": true }
-```
-
-See also: [`docs/environment-variables.md`](./environment-variables.md) (`STELLAR_NETWORK`, `ZENTRIXPAY_ALLOW_MAINNET`).
-
+_Last updated: 2026-10_ — update this file whenever deployment requirements change.

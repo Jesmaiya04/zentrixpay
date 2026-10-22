@@ -1,5 +1,6 @@
 # Dependencies
 node_modules/
+.pnpm-store/
 
 # Builds
 dist/
@@ -22,6 +23,12 @@ packages/registry-client/bindings-tmp/
 
 # Logs
 *.log
+
+# Test / dev scratch files
+test-api.txt
+
+# Vitest / Jest snapshot directories
+**/__snapshots__/
 
 # Editor / OS
 .DS_Store

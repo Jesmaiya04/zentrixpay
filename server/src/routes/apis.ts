@@ -61,7 +61,7 @@ import {
 } from "../lib/idempotency.js";
 import { decryptSecret } from "../utils/secretBox.js";
 import { getLogger } from "../lib/logger.js";
-import { config } from "../config.js";
+import { config, upstreamKeyRing } from "../config.js";
 
 const router: RouterType = Router();
 
@@ -506,13 +506,13 @@ async function proxyHandler(req: Request, res: Response) {
 
   const headers = filterRequestHeaders(req.headers);
   const secrets: UpstreamSecrets = { values: [] };
-  if (api.upstreamHeaderName && api.upstreamHeaderValueEnc && config.UPSTREAM_SECRET_KEY) {
-    const value = decryptSecret(api.upstreamHeaderValueEnc, config.UPSTREAM_SECRET_KEY);
+  if (api.upstreamHeaderName && api.upstreamHeaderValueEnc && upstreamKeyRing.length > 0) {
+    const value = decryptSecret(api.upstreamHeaderValueEnc, upstreamKeyRing, config.UPSTREAM_SECRET_KEY);
     headers[api.upstreamHeaderName] = value;
     secrets.values.push(value);
   }
-  if (api.upstreamQueryName && api.upstreamQueryValueEnc && config.UPSTREAM_SECRET_KEY) {
-    const value = decryptSecret(api.upstreamQueryValueEnc, config.UPSTREAM_SECRET_KEY);
+  if (api.upstreamQueryName && api.upstreamQueryValueEnc && upstreamKeyRing.length > 0) {
+    const value = decryptSecret(api.upstreamQueryValueEnc, upstreamKeyRing, config.UPSTREAM_SECRET_KEY);
     withSecretQueryParam(target, api.upstreamQueryName, value);
     secrets.queryName = api.upstreamQueryName;
     secrets.values.push(value);
