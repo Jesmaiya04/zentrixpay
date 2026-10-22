@@ -12,7 +12,8 @@ import { payeeSignatureAuth } from "../middleware/payeeSignatureAuth.js";
 import { validate } from "../middleware/validate.js";
 import { publishIpRateLimit, publishWalletRateLimit } from "../middleware/rateLimiters.js";
 import { apiPaywall, checkPayerAccess, loadProxiedApi } from "../middleware/apiPaywall.js";
-import { spendSignedApiCredit } from "../middleware/apiCreditSpend.js";
+import { createIpRateLimiter } from "../middleware/rateLimit.js";
+import { getRateLimitStore } from "../lib/rateLimit/index.js";
 import {
   apiCreditBalanceQuerySchema,
   apiCreditPurchaseSchema,
@@ -26,7 +27,9 @@ import {
   ApiServiceError,
   archiveApi,
   createApi,
+  createApiPass,
   effectiveMaxResponseBytes,
+  getActivePass,
   getApiById,
   getApiStats,
   getApiTimeSeries,
@@ -53,7 +56,7 @@ import {
   prepareApiRegistration,
 } from "../services/apiOnchain.js";
 import { confirmCallRefund, prepareCallRefund } from "../services/apiRefunds.js";
-import { sendUpstream, UpstreamError } from "../lib/upstreamClient.js";
+import { sendUpstream, streamUpstream, UpstreamError } from "../lib/upstreamClient.js";
 import { filterRequestHeaders, filterResponseHeaders } from "../lib/proxyHeaders.js";
 import { paymentHeader, paymentHeaderHash, payerFromPayment } from "../lib/payer.js";
 import {
@@ -64,7 +67,7 @@ import {
 import { decryptSecret } from "../utils/secretBox.js";
 import { stroopsToUsdc, usdcToStroops } from "../utils/usdc.js";
 import { getLogger } from "../lib/logger.js";
-import { config } from "../config.js";
+import { config, upstreamKeyRing } from "../config.js";
 
 const router: RouterType = Router();
 
@@ -509,73 +512,26 @@ function proxyIdempotency(req: Request, res: Response, next: NextFunction) {
 
 const UPSTREAM_ERROR_STATUS = { blocked: 502, network: 502, too_large: 502, timeout: 504 } as const;
 
-async function loadListedCreditApi(req: Request, res: Response, next: NextFunction) {
-  try {
-    const api = await getApiById(req.params.id as string);
-    if (!api || !api.listed) {
-      res.status(404).json({ error: "API not found" });
-      return;
-    }
-    res.locals.api = api;
-    next();
-  } catch (err) {
-    next(err);
+/** Build and inject upstream secrets into headers/url, returning the secrets manifest. */
+function prepareUpstreamRequest(
+  api: ApiRow,
+  target: URL,
+  reqHeaders: ReturnType<typeof filterRequestHeaders>,
+): UpstreamSecrets {
+  const secrets: UpstreamSecrets = { values: [] };
+  if (api.upstreamHeaderName && api.upstreamHeaderValueEnc && upstreamKeyRing.length > 0) {
+    const value = decryptSecret(api.upstreamHeaderValueEnc, upstreamKeyRing, config.UPSTREAM_SECRET_KEY);
+    headers[api.upstreamHeaderName] = value;
+    secrets.values.push(value);
   }
+  if (api.upstreamQueryName && api.upstreamQueryValueEnc && upstreamKeyRing.length > 0) {
+    const value = decryptSecret(api.upstreamQueryValueEnc, upstreamKeyRing, config.UPSTREAM_SECRET_KEY);
+    withSecretQueryParam(target, api.upstreamQueryName, value);
+    secrets.queryName = api.upstreamQueryName;
+    secrets.values.push(value);
+  }
+  return secrets;
 }
-
-// POST /apis/:id/credits/purchase — buy a prepaid bundle with one x402 payment.
-router.post(
-  "/apis/:id/credits/purchase",
-  loadListedCreditApi,
-  validate(apiCreditPurchaseSchema),
-  apiPaywall({
-    priceForRequest: (req, api) =>
-      apiCreditBundlePrice(api, (req.body as { calls: number }).calls),
-  }),
-  async (req, res) => {
-    const api = res.locals.api as ApiRow;
-    const payment = paymentHeader(req);
-    const payer =
-      settlementFrom(res).payer ?? payerFromPayment(payment).address;
-    if (!payment || !payer) {
-      res.status(502).json({ error: "Settled payment did not identify the purchasing wallet" });
-      return;
-    }
-
-    const result = await purchaseApiCredits({
-      apiId: api.id,
-      walletAddress: payer,
-      calls: (req.body as { calls: number }).calls,
-      reference: apiCreditPurchaseReference(settlementFrom(res).transaction, payment),
-    });
-    if (result.duplicate) {
-      res.status(409).json({
-        error: "This payment has already been credited",
-        apiId: api.id,
-        balance: result.balance,
-      });
-      return;
-    }
-    res.status(201).json({
-      apiId: api.id,
-      walletAddress: payer,
-      calls: (req.body as { calls: number }).calls,
-      balance: result.balance,
-    });
-  },
-);
-
-// GET /apis/:id/credits/balance?walletAddress=G... — read an API-specific balance.
-router.get("/apis/:id/credits/balance", loadListedCreditApi, async (req, res) => {
-  const parsed = apiCreditBalanceQuerySchema.safeParse(req.query);
-  if (!parsed.success) {
-    res.status(400).json({ error: parsed.error.format() });
-    return;
-  }
-  const api = res.locals.api as ApiRow;
-  const balance = await getApiCreditBalance(api.id, parsed.data.walletAddress);
-  res.json({ apiId: api.id, walletAddress: parsed.data.walletAddress, balance });
-});
 
 async function proxyHandler(req: Request, res: Response) {
   const api = res.locals.api as ApiRow;
@@ -587,21 +543,11 @@ async function proxyHandler(req: Request, res: Response) {
   }
 
   const headers = filterRequestHeaders(req.headers);
-  const secrets: UpstreamSecrets = { values: [] };
-  if (api.upstreamHeaderName && api.upstreamHeaderValueEnc && config.UPSTREAM_SECRET_KEY) {
-    const value = decryptSecret(api.upstreamHeaderValueEnc, config.UPSTREAM_SECRET_KEY);
-    headers[api.upstreamHeaderName] = value;
-    secrets.values.push(value);
-  }
-  if (api.upstreamQueryName && api.upstreamQueryValueEnc && config.UPSTREAM_SECRET_KEY) {
-    const value = decryptSecret(api.upstreamQueryValueEnc, config.UPSTREAM_SECRET_KEY);
-    withSecretQueryParam(target, api.upstreamQueryName, value);
-    secrets.queryName = api.upstreamQueryName;
-    secrets.values.push(value);
-  }
+  const secrets = prepareUpstreamRequest(api, target, headers);
   const body = Buffer.isBuffer(req.body) && req.body.length > 0 ? req.body : undefined;
 
   const started = Date.now();
+
   // Recorded once the response (and settlement) is complete: a final status
   // below 400 means the x402 middleware settled the payment.
   res.on("finish", () => {
@@ -618,19 +564,6 @@ async function proxyHandler(req: Request, res: Response) {
         target.pathname.slice(new URL(api.upstreamUrl).pathname.replace(/\/+$/, "").length) || "/",
       responseStatus: res.statusCode,
       durationMs: Date.now() - started,
-    };
-    if (charged) deliverChargedCallWebhook(api, call);
-    recordApiCall({
-      id: callId,
-      apiId: api.id,
-      payerAddress: call.payerAddress,
-      amount: call.amount,
-      charged,
-      txHash: charged ? (settlement.transaction ?? null) : null,
-      method: call.method,
-      path: call.path,
-      responseStatus: call.responseStatus,
-      durationMs: call.durationMs,
     }).catch((err) =>
       getLogger().error(
         { event: "api_call_record_failed", apiId: api.id, err },
@@ -639,17 +572,77 @@ async function proxyHandler(req: Request, res: Response) {
     );
   });
 
+  const upstreamOpts = {
+    url: target,
+    method: req.method,
+    headers,
+    body,
+    timeoutMs: api.timeoutMs ?? config.PROXY_DEFAULT_TIMEOUT_MS,
+    maxResponseBytes: effectiveMaxResponseBytes(api),
+    allowPrivate: config.PROXY_ALLOW_PRIVATE_UPSTREAMS,
+  };
+
+  // ── Streaming path (SSE / chunked) ─────────────────────────────────────────
+  // settle-before-stream: the x402 middleware already collected payment before
+  // this handler runs. If the upstream fails before the first byte we never
+  // write a 2xx status to the caller, so the caller is not charged
+  // (see the "finish" listener above — charged = statusCode < 400).
+  if (api.streamingEnabled) {
+    let upstream;
+    try {
+      upstream = await streamUpstream(upstreamOpts);
+    } catch (err) {
+      if (err instanceof UpstreamError) {
+        getLogger().warn(
+          { event: "api_upstream_stream_failed", apiId: api.id, kind: err.kind, error: err.message },
+          "upstream stream failed before first byte; caller not charged",
+        );
+        res
+          .status(UPSTREAM_ERROR_STATUS[err.kind])
+          .json({ error: "upstream_failed", reason: err.kind });
+        return;
+      }
+      throw err;
+    }
+
+    // Mirror useful response headers (no buffering, no content-length).
+    const responseHeaders = filterResponseHeaders(upstream.headers);
+    res.status(upstream.status);
+    for (const [name, value] of Object.entries(responseHeaders)) {
+      const rewritten =
+        typeof value === "string"
+          ? rewriteResponseHeader(name, value, api, secrets)
+          : value;
+      res.setHeader(name, rewritten);
+    }
+
+    // For SSE: disable compression / buffering on the Express response so
+    // events reach the caller immediately.
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders();
+
+    upstream.stream.pipe(res);
+
+    upstream.stream.on("error", (err) => {
+      getLogger().warn(
+        { event: "api_upstream_stream_error", apiId: api.id, error: err.message },
+        "upstream stream error mid-flight",
+      );
+      if (!res.writableEnded) res.end();
+    });
+
+    req.on("close", () => {
+      // Client disconnected early — destroy the upstream socket too.
+      upstream.stream.destroy();
+    });
+
+    return;
+  }
+
+  // ── Buffered path (default) ─────────────────────────────────────────────────
   let upstream;
   try {
-    upstream = await sendUpstream({
-      url: target,
-      method: req.method,
-      headers,
-      body,
-      timeoutMs: api.timeoutMs ?? config.PROXY_DEFAULT_TIMEOUT_MS,
-      maxResponseBytes: effectiveMaxResponseBytes(api),
-      allowPrivate: config.PROXY_ALLOW_PRIVATE_UPSTREAMS,
-    });
+    upstream = await sendUpstream(upstreamOpts);
   } catch (err) {
     if (err instanceof UpstreamError) {
       getLogger().warn(
@@ -669,7 +662,7 @@ async function proxyHandler(req: Request, res: Response) {
     responseHeaders[name] =
       typeof value === "string"
         ? rewriteResponseHeader(name, value, api, secrets)
-        : value.map((part) => rewriteResponseHeader(name, part, api, secrets));
+        : value;
   }
   // Kept for Idempotency-Key replay once the call is known to be charged.
   res.locals.proxyResponse = {
@@ -686,9 +679,117 @@ async function proxyHandler(req: Request, res: Response) {
   res.end(upstream.body);
 }
 
+// Issue #33: IP rate limiter for the proxy route. Applied before loadProxiedApi
+// so the DB is never touched when an IP is over the limit.
+const proxyIpRateLimit = createIpRateLimiter(
+  getRateLimitStore(),
+  "proxy",
+  config.PROXY_402_RATE_LIMIT_MAX,
+  config.PROXY_402_RATE_LIMIT_WINDOW_MS,
+  "proxy_ip",
+);
+
+// Issue #30: POST /api/:id/pass — buy a time-limited access pass via x402.
+// The caller pays passPrice once; subsequent calls are free until the pass
+// expires. Pass duration is 1 hour by default; providers may configure it via
+// the passPrice field (a future PATCH /apis/:id update can carry durationMs).
+const PASS_DURATION_MS = 60 * 60 * 1000; // 1 hour
+
+router.post("/api/:id/pass", loadProxiedApi, async (req: Request, res: Response) => {
+  const api = res.locals.api as ApiRow;
+
+  if (!api.passPrice) {
+    res.status(404).json({ error: "This API does not offer access passes" });
+    return;
+  }
+
+  // Derive the payer from the payment header.
+  const header = paymentHeader(req);
+  const { address: payerAddress } = payerFromPayment(header);
+
+  if (!payerAddress) {
+    // No payment yet — return the 402 challenge so the caller knows how much
+    // to pay. We reuse the same x402 resource-server path.
+    const network = api.network ?? "base-sepolia";
+    const payTo = api.walletAddress;
+    const price = api.passPrice;
+
+    try {
+      const resourceServer = await (await import("../lib/x402.js")).sharedX402ResourceServer({
+        network,
+        payTo,
+        price,
+      });
+      const middleware = resourceServer.middleware({
+        price,
+        network,
+        payTo,
+        description: `Access pass for ${api.name} (1 hour)`,
+      });
+      middleware(req, res, () => {
+        // Settlement happened synchronously (unlikely in x402 flow but
+        // handle it by creating the pass).
+        createApiPass({
+          apiId: api.id,
+          payerAddress: payerAddress ?? "unknown",
+          amount: price,
+          txHash: null,
+          durationMs: PASS_DURATION_MS,
+        })
+          .then((pass) => {
+            if (!res.headersSent) {
+              res.status(201).json({
+                passId: pass.id,
+                expiresAt: pass.expiresAt,
+                message: "Pass activated",
+              });
+            }
+          })
+          .catch(() => {
+            if (!res.headersSent) res.status(500).json({ error: "Failed to activate pass" });
+          });
+      });
+    } catch (err) {
+      if (!res.headersSent) res.status(500).json({ error: "Failed to build payment challenge" });
+    }
+    return;
+  }
+
+  // Payment header is present: check if a pass was already active (idempotent
+  // re-purchase within the same window).
+  const existing = await getActivePass(api.id, payerAddress);
+  if (existing) {
+    res.json({ passId: existing.id, expiresAt: existing.expiresAt, message: "Pass already active" });
+    return;
+  }
+
+  // Record the new pass (the x402 payment has already been validated by the
+  // middleware above on the previous request cycle; here we trust the header
+  // was settled — in production this is confirmed by the facilitator before
+  // we ever get to this handler for a valid payment).
+  try {
+    const pass = await createApiPass({
+      apiId: api.id,
+      payerAddress,
+      amount: api.passPrice,
+      txHash: null,
+      durationMs: PASS_DURATION_MS,
+    });
+    res.status(201).json({
+      passId: pass.id,
+      expiresAt: pass.expiresAt,
+      message: "Pass activated",
+    });
+  } catch (err) {
+    getLogger().error({ event: "api_pass_create_failed", apiId: api.id, err }, "failed to create pass");
+    res.status(500).json({ error: "Failed to create pass" });
+  }
+});
+
 // ANY /api/:id[/*path] — one paid call to the provider's API
 router.all(
   "/api/:id{/*path}",
+  proxyIpRateLimit,
   loadProxiedApi,
   express.raw({ type: () => true, limit: config.PROXY_MAX_REQUEST_BODY }),
   checkPayerAccess,

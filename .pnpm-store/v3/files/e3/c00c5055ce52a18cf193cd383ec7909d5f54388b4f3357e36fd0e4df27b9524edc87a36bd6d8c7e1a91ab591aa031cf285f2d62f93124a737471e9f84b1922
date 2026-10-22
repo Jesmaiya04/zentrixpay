@@ -1,9 +1,0 @@
-import {
-  ExactStellarScheme
-} from "../../chunk-SOJRTSRS.mjs";
-import "../../chunk-4HPDVFME.mjs";
-import "../../chunk-AKQQWUZI.mjs";
-export {
-  ExactStellarScheme
-};
-//# sourceMappingURL=index.mjs.map

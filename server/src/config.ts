@@ -106,10 +106,18 @@ const envSchema = z.object({
   // API proxy (pay-per-call gateway)
   // 32-byte key (64 hex chars) used to encrypt providers' upstream secret
   // headers at rest. Without it, APIs cannot be registered with a secret.
+  // Kept for backwards-compatibility; prefer UPSTREAM_SECRET_KEYS for new
+  // deployments (see #53).
   UPSTREAM_SECRET_KEY: z
     .string()
     .regex(/^[0-9a-fA-F]{64}$/, "UPSTREAM_SECRET_KEY must be 64 hex characters")
     .optional(),
+  // Key ring for secret rotation (#53): comma-separated "id:hex64" pairs.
+  // The FIRST entry is the active key used for all new encryptions; older
+  // entries remain so existing ciphertexts can still be decrypted.
+  // Example: UPSTREAM_SECRET_KEYS=k2:aabbcc...64hex,k1:112233...64hex
+  // When set, this takes precedence over UPSTREAM_SECRET_KEY.
+  UPSTREAM_SECRET_KEYS: z.string().optional(),
   // Largest request body forwarded to an upstream API (express size string).
   PROXY_MAX_REQUEST_BODY: z.string().default("5mb"),
   // Upstream responses are held in memory until payment settles, so they are capped.
@@ -135,6 +143,11 @@ const envSchema = z.object({
     .enum(["true", "false"])
     .default("false")
     .transform((v) => v === "true"),
+
+  // Issue #33: IP rate limiter on /api/:id — rejects 402-spam before DB is touched.
+  // Max unpaid requests per IP per window; set to 0 to disable.
+  PROXY_402_RATE_LIMIT_MAX: z.coerce.number().int().min(0).default(60),
+  PROXY_402_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
   // How long a proxied API's row is cached between DB lookups (#34). Edits
   // invalidate the entry, so this only bounds staleness across replicas.
   PROXY_API_CACHE_TTL_MS: z.coerce.number().int().min(0).default(5_000),
@@ -182,4 +195,75 @@ if (networkIssues.length > 0) {
   process.exit(1);
 }
 
+// ── Mainnet safety guard (#51) ────────────────────────────────────────────────
+// Refuse to start if the server is configured for mainnet but has settings that
+// are only safe on a local/testnet environment.  This prevents a misconfigured
+// production deployment from silently accepting SSRF or leaking funds.
+
+/**
+ * Returns a list of human-readable violation messages for mainnet-unsafe
+ * settings.  An empty array means the config is safe to run on mainnet.
+ * Exported so tests can exercise the logic without calling process.exit.
+ */
+export function mainnetSafetyViolations(cfg: typeof parsed.data): string[] {
+  if (cfg.STELLAR_NETWORK !== "mainnet") return [];
+
+  const violations: string[] = [];
+
+  if (cfg.PROXY_ALLOW_PRIVATE_UPSTREAMS) {
+    violations.push(
+      "PROXY_ALLOW_PRIVATE_UPSTREAMS=true is not allowed on mainnet — " +
+        "it would permit SSRF attacks via provider-supplied upstream URLs.",
+    );
+  }
+
+  return violations;
+}
+
+if (parsed.data.STELLAR_NETWORK === "mainnet") {
+  const violations = mainnetSafetyViolations(parsed.data);
+  if (violations.length > 0) {
+    rootLogger.error(
+      { event: "mainnet_unsafe_config", violations },
+      "refusing to start: unsafe settings detected for mainnet deployment",
+    );
+    for (const v of violations) {
+      rootLogger.error(v);
+    }
+    process.exit(1);
+  }
+}
+
 export const config = parsed.data;
+
+// ── Key ring (#53) ────────────────────────────────────────────────────────────
+// Parse UPSTREAM_SECRET_KEYS into an ordered list of {id, hex} entries.
+// The first entry is the active key.  When only UPSTREAM_SECRET_KEY is set we
+// wrap it in a single-entry ring so the rest of the codebase can always use the
+// ring API.
+
+import { parseKeyRing, type KeyRingEntry } from "./utils/secretBox.js";
+
+function buildEffectiveKeyRing(): KeyRingEntry[] {
+  if (config.UPSTREAM_SECRET_KEYS) {
+    try {
+      return parseKeyRing(config.UPSTREAM_SECRET_KEYS);
+    } catch (err) {
+      rootLogger.error(
+        { event: "config_invalid_key_ring", err },
+        "UPSTREAM_SECRET_KEYS is invalid",
+      );
+      process.exit(1);
+    }
+  }
+  if (config.UPSTREAM_SECRET_KEY) {
+    return [{ id: "default", hex: config.UPSTREAM_SECRET_KEY }];
+  }
+  return [];
+}
+
+/**
+ * Parsed key ring for encrypting / decrypting upstream secrets.
+ * Empty when neither UPSTREAM_SECRET_KEY nor UPSTREAM_SECRET_KEYS is set.
+ */
+export const upstreamKeyRing: KeyRingEntry[] = buildEffectiveKeyRing();

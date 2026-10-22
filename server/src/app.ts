@@ -16,6 +16,7 @@ import resourceRouter from "./routes/resources.js";
 import verifyRouter from "./routes/verify.js";
 import paymentsRouter from "./routes/payments.js";
 import apisRouter from "./routes/apis.js";
+import discoveryRouter from "./routes/discovery.js";
 import docsRouter from "./routes/docs.js";
 import metricsRouter from "./routes/metrics.js";
 
@@ -42,6 +43,7 @@ export function createApp(): Express {
   app.use(verifyRouter);
   app.use(paymentsRouter);
   app.use(apisRouter);
+  app.use(discoveryRouter);
   app.use(metricsRouter);
 
   // OpenAPI spec + Swagger UI (all envs; UI is CDN-based, no extra package needed)

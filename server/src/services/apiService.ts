@@ -1,11 +1,12 @@
 import { randomBytes } from "node:crypto";
-import { and, asc, desc, eq, ilike, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, ilike, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
-import { apiCalls, apis, type ApiPriceRule } from "../db/schema.js";
-import { config } from "../config.js";
+import { apiCalls, apis } from "../db/schema.js";
+import { config, upstreamKeyRing } from "../config.js";
 import { encryptSecret } from "../utils/secretBox.js";
 import { validateUpstreamUrl } from "../lib/upstreamGuard.js";
 import { sendUpstream } from "../lib/upstreamClient.js";
+import { createTtlCache } from "../lib/ttlCache.js";
 import type { apiCatalogSortValues } from "../schemas/requests.js";
 
 export type ApiRow = typeof apis.$inferSelect;
@@ -46,6 +47,10 @@ export function toPublicApi(api: ApiRow) {
     allowedMethods: api.allowedMethods,
     priceRules: api.priceRules ?? [],
     tags: api.tags,
+    // Issue #30: callers can see whether a pass is offered and at what price.
+    passPrice: api.passPrice ?? null,
+    // Issue #32: free calls per day this provider offers to new callers.
+    freeCallsPerDay: api.freeCallsPerDay,
     proxyUrl: proxyUrlOf(api),
     openapiUrl: api.openapiSpec ? `${config.BASE_URL}/apis/${api.id}/openapi.json` : null,
     // Where callers can check price and payee for themselves.
@@ -81,6 +86,7 @@ export function toOwnerApi(api: ApiRow) {
     payerAllowlist: api.payerAllowlist,
     payerDenylist: api.payerDenylist,
     listed: api.listed,
+    streamingEnabled: api.streamingEnabled,
     onchainStatus: api.onchainStatus,
     ownershipVerified: Boolean(api.ownershipVerifiedAt),
     ownershipVerification: {
@@ -108,14 +114,15 @@ function checkedUpstreamUrl(raw: string): string {
   }
 }
 
-function secretKey(): string {
-  if (!config.UPSTREAM_SECRET_KEY) {
+/** Returns the active key ring, or throws 503 if no key is configured. */
+function activeKeyRing() {
+  if (upstreamKeyRing.length === 0) {
     throw new ApiServiceError(
       503,
-      "This server cannot store upstream secrets (UPSTREAM_SECRET_KEY is not configured)",
+      "This server cannot store upstream secrets (UPSTREAM_SECRET_KEY / UPSTREAM_SECRET_KEYS is not configured)",
     );
   }
-  return config.UPSTREAM_SECRET_KEY;
+  return upstreamKeyRing;
 }
 
 function encryptedHeader(header: { name: string; value: string } | null | undefined) {
@@ -123,7 +130,7 @@ function encryptedHeader(header: { name: string; value: string } | null | undefi
   if (header === null) return { upstreamHeaderName: null, upstreamHeaderValueEnc: null };
   return {
     upstreamHeaderName: header.name.toLowerCase(),
-    upstreamHeaderValueEnc: encryptSecret(header.value, secretKey()),
+    upstreamHeaderValueEnc: encryptSecret(header.value, activeKeyRing()),
   };
 }
 
@@ -133,7 +140,7 @@ function encryptedQueryParam(param: { name: string; value: string } | null | und
   // Query parameter names are case-sensitive, so the name is kept as given.
   return {
     upstreamQueryName: param.name,
-    upstreamQueryValueEnc: encryptSecret(param.value, secretKey()),
+    upstreamQueryValueEnc: encryptSecret(param.value, activeKeyRing()),
   };
 }
 
@@ -192,6 +199,10 @@ export interface CreateApiInput {
   tags: string[];
   payerAllowlist?: string[];
   payerDenylist?: string[];
+  /** Issue #30: price of a time-limited access pass (undefined = passes not offered). */
+  passPrice?: string;
+  /** Issue #32: free calls per wallet per day before the paywall applies (0 = disabled). */
+  freeCallsPerDay?: number;
 }
 
 export async function createApi(input: CreateApiInput): Promise<ApiRow> {
@@ -212,8 +223,11 @@ export async function createApi(input: CreateApiInput): Promise<ApiRow> {
       tags: input.tags,
       payerAllowlist: input.payerAllowlist ?? null,
       payerDenylist: input.payerDenylist ?? [],
+      passPrice: input.passPrice ?? null,
+      freeCallsPerDay: input.freeCallsPerDay ?? 0,
       ownershipToken: randomBytes(16).toString("hex"),
       openapiSpec: checkedOpenApiSpec(input.openapiSpec),
+      streamingEnabled: input.streamingEnabled ?? false,
       ...encryptedHeader(input.upstreamHeader),
       ...encryptedQueryParam(input.upstreamQueryParam),
     })
@@ -340,6 +354,10 @@ export interface UpdateApiInput {
   payerAllowlist?: string[] | null;
   payerDenylist?: string[];
   listed?: boolean;
+  /** Issue #30: null disables passes; a new price enables / reprices them. */
+  passPrice?: string | null;
+  /** Issue #32: 0 disables free calls. */
+  freeCallsPerDay?: number;
 }
 
 export async function updateApi(api: ApiRow, input: UpdateApiInput): Promise<ApiRow> {
@@ -372,6 +390,8 @@ export async function updateApi(api: ApiRow, input: UpdateApiInput): Promise<Api
     tags: input.tags,
     payerAllowlist: input.payerAllowlist,
     payerDenylist: input.payerDenylist,
+    passPrice: input.passPrice,
+    freeCallsPerDay: input.freeCallsPerDay,
     ...encryptedHeader(input.upstreamHeader),
     ...encryptedQueryParam(input.upstreamQueryParam),
   };
@@ -476,6 +496,83 @@ export interface RecordCallInput {
 
 export async function recordApiCall(input: RecordCallInput): Promise<void> {
   await db.insert(apiCalls).values(input);
+}
+
+// ── Access passes (#30) ──────────────────────────────────────────────────────
+
+export interface CreatePassInput {
+  apiId: string;
+  payerAddress: string;
+  /** USDC amount paid for the pass. */
+  amount: string;
+  /** Settlement transaction hash. */
+  txHash: string | null;
+  /** Pass duration in milliseconds. */
+  durationMs: number;
+}
+
+/**
+ * Record a newly purchased access pass. The pass is immediately active and
+ * expires after `durationMs` from now.
+ */
+export async function createApiPass(input: CreatePassInput) {
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + input.durationMs);
+  const [row] = await db
+    .insert(apiPasses)
+    .values({
+      apiId: input.apiId,
+      payerAddress: input.payerAddress,
+      amount: input.amount,
+      txHash: input.txHash,
+      activeFrom: now,
+      expiresAt,
+    })
+    .returning();
+  return row;
+}
+
+/**
+ * Find the most-recently purchased active pass for a payer + API combination.
+ * Returns null when no active pass exists.
+ */
+export async function getActivePass(apiId: string, payerAddress: string) {
+  const now = new Date();
+  const [row] = await db
+    .select()
+    .from(apiPasses)
+    .where(
+      and(
+        eq(apiPasses.apiId, apiId),
+        eq(apiPasses.payerAddress, payerAddress),
+        gt(apiPasses.expiresAt, now),
+        sql`${apiPasses.activeFrom} <= now()`,
+      ),
+    )
+    .orderBy(desc(apiPasses.expiresAt))
+    .limit(1);
+  return row ?? null;
+}
+
+// ── Free calls quota (#32) ───────────────────────────────────────────────────
+
+/**
+ * Count the free (uncharged) calls a payer has already made to an API today
+ * (UTC calendar day).
+ */
+export async function countFreeCallsToday(apiId: string, payerAddress: string): Promise<number> {
+  const [row] = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(apiCalls)
+    .where(
+      and(
+        eq(apiCalls.apiId, apiId),
+        eq(apiCalls.payerAddress, payerAddress),
+        eq(apiCalls.charged, false),
+        sql`${apiCalls.createdAt} >= date_trunc('day', now() at time zone 'UTC')`,
+      ),
+    );
+  return row?.count ?? 0;
 }
 
 // ── Health checks (#35) ──────────────────────────────────────────────────────
