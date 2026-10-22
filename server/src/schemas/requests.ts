@@ -192,6 +192,10 @@ export const createApiSchema = z
     // Only these wallets may call the API; omit to allow everyone.
     payerAllowlist: payerList.optional(),
     payerDenylist: payerList.default([]),
+    // Issue #30: price of a time-limited access pass (null/omit = passes not offered).
+    passPrice: usdcPrice.optional(),
+    // Issue #32: how many free calls a wallet gets per day before the paywall kicks in.
+    freeCallsPerDay: z.number().int().min(0).default(0),
   })
   .strict();
 
@@ -215,6 +219,10 @@ export const updateApiSchema = z
     payerAllowlist: payerList.nullable().optional(),
     payerDenylist: payerList.optional(),
     listed: z.boolean().optional(),
+    // Issue #30: null disables passes; a new price enables / reprices them.
+    passPrice: usdcPrice.nullable().optional(),
+    // Issue #32: 0 disables free calls.
+    freeCallsPerDay: z.number().int().min(0).optional(),
   })
   .strict();
 

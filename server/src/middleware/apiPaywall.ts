@@ -1,10 +1,12 @@
 import type { NextFunction, Request, Response } from 'express';
 import { Router } from 'express';
-import { eq } from 'drizzle-orm';
+import { and, eq, gt, sql } from 'drizzle-orm';
 import { db } from '../db/index.js';
-import { api as apiTable } from '../db/schema.js';
+import { apiCalls, apis as apiTable, apiPasses } from '../db/schema.js';
 import type { ApiRow } from '../db/schema.js';
 import { sharedX402ResourceServer } from '../lib/x402.js';
+import { payerFromPayment, paymentHeader } from '../lib/payer.js';
+import { getLogger } from '../lib/logger.js';
 
 export interface ApiPaywallOptions {
   price?: string;
@@ -55,12 +57,137 @@ function buildMiddleware(api: ApiRow, options: ApiPaywallOptions) {
   return router;
 }
 
+/**
+ * Issue #30 / #32: Check whether the payer already has free or paid access so
+ * the x402 paywall can be skipped for this request.
+ *
+ * Resolution order:
+ *  1. Active pass (#30) — payer bought a time-limited pass; skip paywall.
+ *  2. Free quota (#32)  — payer is within the provider's daily free-call
+ *     allowance; consume one free call and skip paywall.
+ *  3. Neither             — fall through to the normal x402 paywall.
+ *
+ * The payer address is extracted from the X-Payment / payment-signature header
+ * when present. If no payment header is attached and no free quota applies,
+ * the request falls through to the paywall which will issue the 402 challenge.
+ */
+export async function checkPayerAccess(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  const api = res.locals.api as ApiRow | undefined;
+
+  if (!api) {
+    res.status(500).json({ error: 'checkPayerAccess requires res.locals.api' });
+    return;
+  }
+
+  // Derive the payer address from the payment header (may be absent on the
+  // first unanswered 402 challenge).
+  const header = paymentHeader(req);
+  const { address: payerAddress } = payerFromPayment(header);
+
+  // ── Issue #30: active pass check ──────────────────────────────────────────
+  if (payerAddress) {
+    try {
+      const now = new Date();
+      const [activePass] = await db
+        .select({ id: apiPasses.id })
+        .from(apiPasses)
+        .where(
+          and(
+            eq(apiPasses.apiId, api.id),
+            eq(apiPasses.payerAddress, payerAddress),
+            gt(apiPasses.expiresAt, now),
+            // activeFrom must be in the past (handles pre-sold passes).
+            sql`${apiPasses.activeFrom} <= now()`,
+          ),
+        )
+        .limit(1);
+
+      if (activePass) {
+        // Payer holds an active pass — bypass the paywall entirely.
+        getLogger().debug(
+          { event: 'api_pass_used', apiId: api.id, passId: activePass.id, payerAddress },
+          'payer has active pass; skipping paywall',
+        );
+        res.locals.passId = activePass.id;
+        res.locals.freeCall = false;
+        next();
+        return;
+      }
+    } catch (err) {
+      getLogger().warn(
+        { event: 'api_pass_check_failed', apiId: api.id, payerAddress, err },
+        'pass check failed; falling through to paywall',
+      );
+    }
+  }
+
+  // ── Issue #32: free-calls quota check ────────────────────────────────────
+  // Only applies when the API has a non-zero free-calls-per-day allowance and
+  // we can identify the payer from the payment header.
+  const freeQuota = api.freeCallsPerDay ?? 0;
+  if (freeQuota > 0 && payerAddress) {
+    try {
+      // Count uncharged calls this payer has made to this API today (UTC).
+      const [row] = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(apiCalls)
+        .where(
+          and(
+            eq(apiCalls.apiId, api.id),
+            eq(apiCalls.payerAddress, payerAddress),
+            eq(apiCalls.charged, false),
+            // today in UTC
+            sql`${apiCalls.createdAt} >= date_trunc('day', now() at time zone 'UTC')`,
+          ),
+        );
+
+      const usedToday = row?.count ?? 0;
+      if (usedToday < freeQuota) {
+        // Under quota: skip paywall and mark this as a free call so the
+        // downstream recorder knows not to charge.
+        getLogger().debug(
+          {
+            event: 'api_free_call',
+            apiId: api.id,
+            payerAddress,
+            usedToday,
+            freeQuota,
+          },
+          'payer within free quota; skipping paywall',
+        );
+        res.locals.freeCall = true;
+        next();
+        return;
+      }
+    } catch (err) {
+      getLogger().warn(
+        { event: 'api_free_quota_check_failed', apiId: api.id, payerAddress, err },
+        'free quota check failed; falling through to paywall',
+      );
+    }
+  }
+
+  // Neither condition met — continue to the x402 paywall.
+  res.locals.freeCall = false;
+  next();
+}
+
 export function apiPaywall(options: ApiPaywallOptions = {}) {
   return async (req: Request, res: Response, next: NextFunction) => {
     const api = res.locals.api as ApiRow | undefined;
 
     if (!api) {
       return res.status(500).json({ error: 'apiPaywall requires res.locals.api' });
+    }
+
+    // If checkPayerAccess already cleared this request (active pass or free
+    // quota), skip the paywall entirely.
+    if (res.locals.passId || res.locals.freeCall) {
+      return next();
     }
 
     const cacheKey = `${api.id}:${options.price ?? api.price ?? ''}:${options.network ?? api.network ?? ''}`;
