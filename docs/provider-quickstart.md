@@ -80,6 +80,10 @@ curl -X POST "$ZENTRIXPAY/apis" \
     "name": "Acme Weather API",
     "description": "Current conditions and 7-day forecast for any city.",
     "price": "0.01",
+    "priceRules": [
+      { "method": "POST", "pathPattern": "/generate", "price": "0.10" },
+      { "method": "GET", "pathPattern": "/status", "price": "0.001" }
+    ],
     "upstreamUrl": "https://api.acme.example.com/v1/weather",
     "allowedMethods": ["GET"],
     "upstreamHeader": "X-Acme-Secret"
@@ -93,6 +97,7 @@ Field reference:
 | `name` | yes | Human-readable name shown to buyers. |
 | `description` | yes | Short description shown on the listing. |
 | `price` | yes | Price **per call, in USDC** (e.g. `"0.01"` = 1 cent). |
+| `priceRules` | no | Optional array of `{ "method", "pathPattern", "price" }` overrides. `*` matches any path text; exact paths take precedence, then the rule with fewer wildcards and more literal characters. Unmatched requests use `price`. |
 | `upstreamUrl` | yes | The real endpoint ZentrixPay proxies to. |
 | `allowedMethods` | yes | HTTP methods buyers may use, e.g. `["GET"]` or `["GET","POST"]`. |
 | `upstreamHeader` | optional | Name of the secret header your upstream requires (see §3). |

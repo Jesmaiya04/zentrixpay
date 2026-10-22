@@ -1,4 +1,5 @@
 import {
+  check,
   pgTable,
   text,
   real,
@@ -10,6 +11,7 @@ import {
   index,
   uniqueIndex,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { createId } from "@paralleldrive/cuid2";
 
 export const resourceTypeEnum = pgEnum("resource_type", ["file", "link"]);
@@ -27,6 +29,12 @@ export const onchainStatusEnum = pgEnum("onchain_status_enum", [
   "registered",
   "failed",
 ]);
+
+export interface ApiPriceRule {
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+  pathPattern: string;
+  price: string;
+}
 
 // Publishers — humans or AI agents that publish resources
 export const publishers = pgTable("publishers", {
@@ -138,8 +146,11 @@ export const apis = pgTable(
     // Never exposed publicly: callers must go through the paid proxy.
     upstreamUrl: text("upstream_url").notNull(),
     price: text("price").notNull(), // USDC per call
+    priceRules: jsonb("price_rules").$type<ApiPriceRule[]>().notNull().default([]),
     walletAddress: text("wallet_address").notNull(),
     allowedMethods: jsonb("allowed_methods").$type<string[]>().notNull().default(["GET"]),
+    payerAllowlist: jsonb("payer_allowlist").$type<string[] | null>(),
+    payerDenylist: jsonb("payer_denylist").$type<string[]>().notNull().default([]),
     // Header the proxy adds to every upstream request, e.g. the provider's own
     // API key. The value is AES-256-GCM encrypted (see utils/secretBox.ts).
     upstreamHeaderName: text("upstream_header_name"),
@@ -180,6 +191,65 @@ export const apis = pgTable(
     publisherIdx: index("idx_apis_publisher_id").on(table.publisherId),
     catalogIdx: index("idx_apis_listed_created_at").on(table.listed, table.createdAt),
     tagsIdx: index("idx_apis_tags").using("gin", table.tags),
+  }),
+);
+
+export const apiCreditBalances = pgTable(
+  "api_credit_balances",
+  {
+    id: text("id")
+      .primaryKey()
+      .$defaultFn(() => createId()),
+    apiId: text("api_id")
+      .notNull()
+      .references(() => apis.id),
+    walletAddress: text("wallet_address").notNull(),
+    balance: integer("balance").notNull().default(0),
+    updatedAt: timestamp("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    apiWalletIdx: uniqueIndex("idx_api_credit_balances_api_wallet").on(
+      table.apiId,
+      table.walletAddress,
+    ),
+    nonNegativeBalance: check("api_credit_balances_balance_check", sql`${table.balance} >= 0`),
+  }),
+);
+
+export const apiCreditLedger = pgTable(
+  "api_credit_ledger",
+  {
+    id: text("id")
+      .primaryKey()
+      .$defaultFn(() => createId()),
+    apiId: text("api_id")
+      .notNull()
+      .references(() => apis.id),
+    walletAddress: text("wallet_address").notNull(),
+    delta: integer("delta").notNull(),
+    entryType: text("entry_type").$type<"purchase" | "spend">().notNull(),
+    reference: text("reference"),
+    requestNonce: text("request_nonce"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    purchaseReferenceIdx: uniqueIndex("idx_api_credit_ledger_purchase_reference")
+      .on(table.reference)
+      .where(sql`${table.entryType} = 'purchase'`),
+    spendNonceIdx: uniqueIndex("idx_api_credit_ledger_spend_nonce").on(
+      table.apiId,
+      table.walletAddress,
+      table.requestNonce,
+    ).where(sql`${table.entryType} = 'spend'`),
+    apiWalletCreatedIdx: index("idx_api_credit_ledger_api_wallet_created").on(
+      table.apiId,
+      table.walletAddress,
+      table.createdAt,
+    ),
+    validEntryType: check(
+      "api_credit_ledger_entry_type_check",
+      sql`${table.entryType} in ('purchase', 'spend')`,
+    ),
   }),
 );
 

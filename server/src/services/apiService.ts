@@ -45,6 +45,7 @@ export function toPublicApi(api: ApiRow) {
     currency: "USDC",
     walletAddress: api.walletAddress,
     allowedMethods: api.allowedMethods,
+    priceRules: api.priceRules ?? [],
     tags: api.tags,
     // Issue #30: callers can see whether a pass is offered and at what price.
     passPrice: api.passPrice ?? null,
@@ -185,6 +186,7 @@ export interface CreateApiInput {
   description?: string;
   upstreamUrl: string;
   price: string;
+  priceRules?: ApiPriceRule[];
   walletAddress: string;
   allowedMethods: string[];
   upstreamHeader?: { name: string; value: string };
@@ -212,6 +214,7 @@ export async function createApi(input: CreateApiInput): Promise<ApiRow> {
       description: input.description,
       upstreamUrl: checkedUpstreamUrl(input.upstreamUrl),
       price: input.price,
+      priceRules: input.priceRules ?? [],
       walletAddress: input.walletAddress,
       allowedMethods: input.allowedMethods,
       timeoutMs: clampTimeout(input.timeoutMs),
@@ -337,6 +340,7 @@ export interface UpdateApiInput {
   description?: string | null;
   upstreamUrl?: string;
   price?: string;
+  priceRules?: ApiPriceRule[] | null;
   walletAddress?: string;
   allowedMethods?: string[];
   upstreamHeader?: { name: string; value: string } | null;
@@ -378,6 +382,7 @@ export async function updateApi(api: ApiRow, input: UpdateApiInput): Promise<Api
     name: input.name,
     description: input.description,
     price: input.price,
+    priceRules: input.priceRules === null ? [] : input.priceRules,
     walletAddress: input.walletAddress,
     allowedMethods: input.allowedMethods,
     timeoutMs: clampTimeout(input.timeoutMs),

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import express, {
   Router,
   type NextFunction,
@@ -15,6 +15,8 @@ import { apiPaywall, checkPayerAccess, loadProxiedApi } from "../middleware/apiP
 import { createIpRateLimiter } from "../middleware/rateLimit.js";
 import { getRateLimitStore } from "../lib/rateLimit/index.js";
 import {
+  apiCreditBalanceQuerySchema,
+  apiCreditPurchaseSchema,
   apiCatalogQuerySchema,
   apiStatsQuerySchema,
   createApiSchema,
@@ -44,6 +46,9 @@ import {
   verifyOwnership,
   type ApiRow,
 } from "../services/apiService.js";
+import { getApiCreditBalance, purchaseApiCredits } from "../services/apiCredits.js";
+import { apiCreditPurchaseReference } from "../lib/apiCreditSignature.js";
+import { deliverChargedCallWebhook } from "../services/webhookService.js";
 import {
   confirmApiPrice,
   confirmApiRegistration,
@@ -60,10 +65,22 @@ import {
   type StoredProxyResponse,
 } from "../lib/idempotency.js";
 import { decryptSecret } from "../utils/secretBox.js";
+import { stroopsToUsdc, usdcToStroops } from "../utils/usdc.js";
 import { getLogger } from "../lib/logger.js";
 import { config, upstreamKeyRing } from "../config.js";
 
 const router: RouterType = Router();
+
+function apiCreditBundlePrice(api: ApiRow, calls: number): string {
+  const highestCallPrice = (api.priceRules ?? []).reduce(
+    (highest, rule) => {
+      const rulePrice = usdcToStroops(rule.price);
+      return rulePrice > highest ? rulePrice : highest;
+    },
+    usdcToStroops(api.price),
+  );
+  return stroopsToUsdc(highestCallPrice * BigInt(calls));
+}
 
 function sendServiceError(res: Response, err: unknown): void {
   if (err instanceof ApiServiceError) {
@@ -536,12 +553,12 @@ async function proxyHandler(req: Request, res: Response) {
   res.on("finish", () => {
     const settlement = settlementFrom(res);
     const charged = res.statusCode < 400;
-    recordApiCall({
-      apiId: api.id,
-      payerAddress: payerFrom(req, settlement),
-      amount: api.price,
-      charged,
-      txHash: charged ? (settlement.transaction ?? null) : null,
+    const callId = randomUUID();
+    const call = {
+      callId,
+      payerAddress:
+        (res.locals.creditPayer as string | undefined) ?? payerFrom(req, settlement),
+      amount: (res.locals.apiCallPrice as string | undefined) ?? api.price,
       method: req.method,
       path:
         target.pathname.slice(new URL(api.upstreamUrl).pathname.replace(/\/+$/, "").length) || "/",
@@ -776,6 +793,7 @@ router.all(
   loadProxiedApi,
   express.raw({ type: () => true, limit: config.PROXY_MAX_REQUEST_BODY }),
   checkPayerAccess,
+  spendSignedApiCredit,
   proxyIdempotency,
   apiPaywall,
   proxyHandler,

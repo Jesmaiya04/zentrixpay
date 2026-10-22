@@ -123,6 +123,7 @@ describe("proxy route", () => {
   let upstream: http.Server;
   let seen: { url?: string; headers?: http.IncomingHttpHeaders; body?: string };
   const app = express();
+  app.disable("x-powered-by");
   app.use(router);
 
   beforeAll(async () => {
@@ -134,7 +135,14 @@ describe("proxy route", () => {
         if (req.url?.startsWith("/v1/big")) return res.end("x".repeat(4096));
         if (req.url?.startsWith("/v1/slow")) return setTimeout(() => res.end("late"), 2000);
         if (req.url?.startsWith("/v1/fail")) return res.writeHead(500).end("boom");
-        res.writeHead(200, { "content-type": "application/json", "set-cookie": "a=b" });
+        res.writeHead(200, {
+          "content-type": "application/json",
+          "set-cookie": "a=b",
+          server: "provider-stack",
+          "x-powered-by": "provider-framework",
+          via: "provider-proxy",
+          "x-aspnet-version": "8.0",
+        });
         res.end(JSON.stringify({ ok: true }));
       });
     });
@@ -159,6 +167,7 @@ describe("proxy route", () => {
     const res = await request(app)
       .post("/api/api1/items/42?expand=1")
       .set("content-type", "application/json")
+      .set("x-tenant-key", "tenant-123")
       .set("x-payment", "abc")
       .set("cookie", "session=1")
       .send('{"a":1}');
@@ -166,9 +175,14 @@ describe("proxy route", () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ ok: true });
     expect(res.headers["set-cookie"]).toBeUndefined();
+    expect(res.headers.server).toBeUndefined();
+    expect(res.headers["x-powered-by"]).toBeUndefined();
+    expect(res.headers.via).toBeUndefined();
+    expect(res.headers["x-aspnet-version"]).toBeUndefined();
     expect(seen.url).toBe("/v1/items/42?expand=1");
     expect(seen.body).toBe('{"a":1}');
     expect(seen.headers?.["x-provider-key"]).toBe("provider-secret");
+    expect(seen.headers?.["x-tenant-key"]).toBe("tenant-123");
     expect(seen.headers?.["x-payment"]).toBeUndefined();
     expect(seen.headers?.cookie).toBeUndefined();
     expect(state.recorded.at(-1)).toMatchObject({
