@@ -11,6 +11,10 @@ export interface ApiPaywallOptions {
   network?: string;
   description?: string;
   mimeType?: string;
+  // x402 Bazaar discovery fields (#50)
+  inputSchema?: Record<string, unknown>;
+  outputSchema?: Record<string, unknown>;
+  category?: string;
 }
 
 const middlewareCache = new Map<string, ReturnType<typeof buildMiddleware>>();
@@ -36,6 +40,10 @@ function buildMiddleware(api: ApiRow, options: ApiPaywallOptions) {
         payTo,
         description: options.description ?? api.description ?? undefined,
         mimeType: options.mimeType ?? api.mimeType ?? undefined,
+        // Discovery metadata forwarded to the x402 resource server when supported
+        ...(options.inputSchema !== undefined && { inputSchema: options.inputSchema }),
+        ...(options.outputSchema !== undefined && { outputSchema: options.outputSchema }),
+        ...(options.category !== undefined && { category: options.category }),
       });
 
       return middleware(req, res, next);
@@ -96,7 +104,3 @@ export async function loadProxiedApi(req: Request, res: Response, next: NextFunc
 export function clearApiPaywallCache() {
   middlewareCache.clear();
 }
-</｜｜DSML｜｜ parameter>
-<｜｜DSML｜｜ parameter name="file_path" string="true">server/src/middleware/apiPaywall.ts</｜｜DSML｜｜ parameter>
-</｜｜DSML｜｜ invoke>
-</｜｜DSML｜｜ calls>

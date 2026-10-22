@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { and, asc, desc, eq, ilike, isNull, or, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { apiCalls, apis } from "../db/schema.js";
-import { config } from "../config.js";
+import { config, upstreamKeyRing } from "../config.js";
 import { encryptSecret } from "../utils/secretBox.js";
 import { validateUpstreamUrl } from "../lib/upstreamGuard.js";
 import { sendUpstream } from "../lib/upstreamClient.js";
@@ -107,14 +107,15 @@ function checkedUpstreamUrl(raw: string): string {
   }
 }
 
-function secretKey(): string {
-  if (!config.UPSTREAM_SECRET_KEY) {
+/** Returns the active key ring, or throws 503 if no key is configured. */
+function activeKeyRing() {
+  if (upstreamKeyRing.length === 0) {
     throw new ApiServiceError(
       503,
-      "This server cannot store upstream secrets (UPSTREAM_SECRET_KEY is not configured)",
+      "This server cannot store upstream secrets (UPSTREAM_SECRET_KEY / UPSTREAM_SECRET_KEYS is not configured)",
     );
   }
-  return config.UPSTREAM_SECRET_KEY;
+  return upstreamKeyRing;
 }
 
 function encryptedHeader(header: { name: string; value: string } | null | undefined) {
@@ -122,7 +123,7 @@ function encryptedHeader(header: { name: string; value: string } | null | undefi
   if (header === null) return { upstreamHeaderName: null, upstreamHeaderValueEnc: null };
   return {
     upstreamHeaderName: header.name.toLowerCase(),
-    upstreamHeaderValueEnc: encryptSecret(header.value, secretKey()),
+    upstreamHeaderValueEnc: encryptSecret(header.value, activeKeyRing()),
   };
 }
 
@@ -132,7 +133,7 @@ function encryptedQueryParam(param: { name: string; value: string } | null | und
   // Query parameter names are case-sensitive, so the name is kept as given.
   return {
     upstreamQueryName: param.name,
-    upstreamQueryValueEnc: encryptSecret(param.value, secretKey()),
+    upstreamQueryValueEnc: encryptSecret(param.value, activeKeyRing()),
   };
 }
 
